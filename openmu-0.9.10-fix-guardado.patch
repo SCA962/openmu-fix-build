@@ -1,0 +1,326 @@
+diff --git a/src/GameLogic/Offline/OfflinePlayerMuHelper.cs b/src/GameLogic/Offline/OfflinePlayerMuHelper.cs
+index 73bc9a13..c36bb58c 100644
+--- a/src/GameLogic/Offline/OfflinePlayerMuHelper.cs
++++ b/src/GameLogic/Offline/OfflinePlayerMuHelper.cs
+@@ -141,7 +141,11 @@ public sealed class OfflinePlayerMuHelper : AsyncDisposable
+     {
+         try
+         {
+-            await this.TickAsync(cancellationToken).ConfigureAwait(false);
++            // Run the whole tick under the player's persistence lock so its structural mutations
++            // (loot pickup, combat ammo/pet destruction, queued equip/jewel actions) never overlap
++            // this bot's periodic progress save, which runs on a separate timer. The tick has no
++            // internal delays, so the lock is held only for its brief duration.
++            await this._player.RunPersistenceExclusiveAsync(() => this.TickAsync(cancellationToken)).ConfigureAwait(false);
+             this._player.OnAiTickSucceeded();
+         }
+         catch (OperationCanceledException)
+diff --git a/src/GameLogic/Player.cs b/src/GameLogic/Player.cs
+index 20de13d0..d6011e91 100644
+--- a/src/GameLogic/Player.cs
++++ b/src/GameLogic/Player.cs
+@@ -54,6 +54,21 @@ public class Player : AsyncDisposable, IBucketMapObserver, IAttackable, IAttacke
+     private readonly AsyncLock _moveLock = new();
+     private readonly AsyncLock _experienceLock = new();
+ 
++    /// <summary>
++    /// Serializes context mutations done by this player's action handlers against the periodic and
++    /// disconnect progress saves, which run on an independent timer flow. See
++    /// <see cref="RunPersistenceExclusiveAsync{T}"/>.
++    /// </summary>
++    private readonly AsyncLock _persistenceLock = new();
++
++    /// <summary>
++    /// Tracks, per asynchronous flow, whether <see cref="_persistenceLock"/> is already held, so the
++    /// lock can be re-entered (Nito's <see cref="AsyncLock"/> is not reentrant). It is an instance
++    /// field on purpose: reentrancy must be tracked per player, so a flow holding player A's lock
++    /// still acquires player B's lock (e.g. during a trade) instead of wrongly skipping it.
++    /// </summary>
++    private readonly AsyncLocal<bool> _persistenceLockHeld = new();
++
+     private readonly Walker _walker;
+ 
+     private readonly AppearanceDataAdapter _appearanceData;
+@@ -1839,12 +1854,86 @@ public class Player : AsyncDisposable, IBucketMapObserver, IAttackable, IAttacke
+     /// <returns>Success of the save operation.</returns>
+     public async ValueTask<bool> SaveProgressAsync(CancellationToken cancellationToken = default)
+     {
+-        if (!this.IsTemplatePlayer)
++        if (this.IsTemplatePlayer)
+         {
+-            return await this.PersistenceContext.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
++            return true;
+         }
+ 
+-        return true;
++        return await this.RunPersistenceExclusiveAsync(
++            () => this.PersistenceContext.SaveChangesAsync(cancellationToken),
++            cancellationToken).ConfigureAwait(false);
++    }
++
++    /// <summary>
++    /// Runs the given operation while holding this player's persistence lock, so that context
++    /// mutations and progress saves for the player never run concurrently.
++    /// </summary>
++    /// <remarks>
++    /// The periodic progress save (<see cref="PlugIns.PeriodicSaveProgressPlugIn"/>) runs on an
++    /// independent timer flow. Action handlers mutate tracked entities with plain field/collection
++    /// writes (e.g. crafting toggling <c>item.ItemOptions</c>) which bypass the persistence context's
++    /// own lock; if such a mutation runs while <see cref="IContext.SaveChangesAsync"/> enumerates the
++    /// change tracker, the save throws (collection-modified / DbUpdateConcurrency) and every following
++    /// save fails too, so the whole session is lost on relog. Serializing the packet handler funnel
++    /// and the save against each other closes that window. The lock is re-entrant per asynchronous
++    /// flow, so an inline save inside an already-serialized handler does not deadlock.
++    /// <para>
++    /// Invariant: never acquire another player's persistence lock (via their
++    /// <see cref="SaveProgressAsync"/> or <see cref="RunPersistenceExclusiveAsync{T}"/>) from inside a
++    /// packet handler, which already holds this player's lock, unless a global lock order is enforced.
++    /// Today only the trade accept does a cross-player save, and it cannot form a cycle because a trade
++    /// has a single accepting side (so the A-then-B acquisition order has no concurrent B-then-A
++    /// counterpart). A second cross-player caller with the opposite order could deadlock.
++    /// </para>
++    /// </remarks>
++    /// <typeparam name="T">The result type of the operation.</typeparam>
++    /// <param name="operation">The operation to run exclusively.</param>
++    /// <param name="cancellationToken">The cancellation token.</param>
++    /// <returns>The result of the operation.</returns>
++    public async ValueTask<T> RunPersistenceExclusiveAsync<T>(Func<ValueTask<T>> operation, CancellationToken cancellationToken = default)
++    {
++        if (this._persistenceLockHeld.Value)
++        {
++            return await operation().ConfigureAwait(false);
++        }
++
++        using var l = await this._persistenceLock.LockAsync(cancellationToken).ConfigureAwait(false);
++        this._persistenceLockHeld.Value = true;
++        try
++        {
++            return await operation().ConfigureAwait(false);
++        }
++        finally
++        {
++            this._persistenceLockHeld.Value = false;
++        }
++    }
++
++    /// <summary>
++    /// Runs the given operation while holding this player's persistence lock.
++    /// See <see cref="RunPersistenceExclusiveAsync{T}"/> for the rationale.
++    /// </summary>
++    /// <param name="operation">The operation to run exclusively.</param>
++    /// <param name="cancellationToken">The cancellation token.</param>
++    /// <returns>A value task which completes when the operation completed.</returns>
++    public async ValueTask RunPersistenceExclusiveAsync(Func<ValueTask> operation, CancellationToken cancellationToken = default)
++    {
++        if (this._persistenceLockHeld.Value)
++        {
++            await operation().ConfigureAwait(false);
++            return;
++        }
++
++        using var l = await this._persistenceLock.LockAsync(cancellationToken).ConfigureAwait(false);
++        this._persistenceLockHeld.Value = true;
++        try
++        {
++            await operation().ConfigureAwait(false);
++        }
++        finally
++        {
++            this._persistenceLockHeld.Value = false;
++        }
+     }
+ 
+     /// <summary>
+diff --git a/src/GameServer/RemoteView/RemotePlayer.cs b/src/GameServer/RemoteView/RemotePlayer.cs
+index 2c0b5843..d7687f76 100644
+--- a/src/GameServer/RemoteView/RemotePlayer.cs
++++ b/src/GameServer/RemoteView/RemotePlayer.cs
+@@ -151,7 +151,7 @@ public class RemotePlayer : Player, IClientVersionProvider, IHasIpAddress
+                     this.Logger.LogDebug("[C->S] {0}", buffer.ToArray().AsString());
+                 }
+ 
+-                await this.MainPacketHandler.HandlePacketAsync(this, buffer).ConfigureAwait(false);
++                await this.RunPersistenceExclusiveAsync(() => this.MainPacketHandler.HandlePacketAsync(this, buffer)).ConfigureAwait(false);
+             }
+             finally
+             {
+diff --git a/src/Persistence/EntityFramework/EntityFrameworkContextBase.cs b/src/Persistence/EntityFramework/EntityFrameworkContextBase.cs
+index 07c6ef8f..4f1a71d3 100644
+--- a/src/Persistence/EntityFramework/EntityFrameworkContextBase.cs
++++ b/src/Persistence/EntityFramework/EntityFrameworkContextBase.cs
+@@ -68,6 +68,55 @@ internal class EntityFrameworkContextBase : IContext
+ 
+     /// <inheritdoc/>
+     public async ValueTask<bool> SaveChangesAsync(CancellationToken cancellationToken = default)
++    {
++        // A player's entities can be mutated by game logic on a flow that is not serialized against
++        // this save (for example item destruction on an attacker's thread during combat). Such a
++        // concurrent mutation makes change detection throw while it enumerates a tracked collection.
++        // The mutation is a single, quick operation, so a bounded retry lands on a stable moment
++        // instead of failing the whole save - which would otherwise leave the session unpersisted and
++        // roll the player back on relog.
++        const int maxAttempts = 3;
++        var attempt = 0;
++        while (true)
++        {
++            attempt++;
++            try
++            {
++                return await this.SaveChangesCoreAsync(cancellationToken).ConfigureAwait(false);
++            }
++            catch (Exception ex) when (attempt < maxAttempts && IsTransientConcurrencyConflict(ex))
++            {
++                this._logger.LogWarning(ex, "Transient concurrency conflict while saving (attempt {Attempt}/{MaxAttempts}); retrying.", attempt, maxAttempts);
++                await Task.Delay(attempt * 10, cancellationToken).ConfigureAwait(false);
++            }
++        }
++    }
++
++    /// <summary>
++    /// Determines whether the exception is a transient conflict caused by a concurrent entity mutation
++    /// racing this save, and is therefore worth retrying.
++    /// </summary>
++    /// <param name="exception">The exception thrown by the save.</param>
++    /// <returns><c>true</c> if the save should be retried.</returns>
++    private static bool IsTransientConcurrencyConflict(Exception exception)
++    {
++        // A concurrent entity mutation racing this save corrupts the change tracker mid-enumeration.
++        // Depending on exactly where change detection was, it surfaces as one of several types - a
++        // modified collection (InvalidOperationException), a transiently-null internal key
++        // (ArgumentNullException/NullReferenceException), or an out-of-range index. All are transient:
++        // the racing mutation is a single quick operation, so a bounded retry lands on a stable moment.
++        // A genuinely persistent error of the same type is not masked - it rethrows once the retries
++        // are exhausted. The deterministic serialization (per-player persistence lock) is the primary
++        // guard; this retry only needs to absorb the rare, bursty sources that lock isn't held for.
++        return exception is DbUpdateConcurrencyException
++            or InvalidOperationException
++            or ArgumentNullException
++            or NullReferenceException
++            or IndexOutOfRangeException
++            or KeyNotFoundException;
++    }
++
++    private async ValueTask<bool> SaveChangesCoreAsync(CancellationToken cancellationToken)
+     {
+         using var l = await this._lock.LockAsync();
+ 
+diff --git a/tests/MUnique.OpenMU.Tests/PersistenceLockTest.cs b/tests/MUnique.OpenMU.Tests/PersistenceLockTest.cs
+new file mode 100644
+index 00000000..1ca00dc0
+--- /dev/null
++++ b/tests/MUnique.OpenMU.Tests/PersistenceLockTest.cs
+@@ -0,0 +1,114 @@
++// <copyright file="PersistenceLockTest.cs" company="MUnique">
++// Licensed under the MIT License. See LICENSE file in the project root for full license information.
++// </copyright>
++
++namespace MUnique.OpenMU.Tests;
++
++using System.Threading;
++
++/// <summary>
++/// Tests for the per-player persistence lock (<see cref="MUnique.OpenMU.GameLogic.Player.RunPersistenceExclusiveAsync(System.Func{System.Threading.Tasks.ValueTask},System.Threading.CancellationToken)"/>),
++/// which serializes a player's context mutations against its periodic/disconnect progress saves so they
++/// can never run concurrently. Without it, a mutation running during <c>SaveChangesAsync</c> corrupts the
++/// change tracker and rolls the whole session back.
++/// </summary>
++[TestFixture]
++public class PersistenceLockTest
++{
++    /// <summary>
++    /// Verifies that concurrent exclusive operations for the same player never overlap.
++    /// </summary>
++    [Test]
++    public async Task ConcurrentAccessIsSerializedAsync()
++    {
++        var player = await PlayerTestHelper.CreatePlayerAsync().ConfigureAwait(false);
++        var concurrent = 0;
++        var overlapDetected = false;
++
++        async ValueTask BodyAsync()
++        {
++            if (Interlocked.Increment(ref concurrent) > 1)
++            {
++                overlapDetected = true;
++            }
++
++            await Task.Delay(1).ConfigureAwait(false);
++            Interlocked.Decrement(ref concurrent);
++        }
++
++        var tasks = Enumerable.Range(0, 50)
++            .Select(_ => player.RunPersistenceExclusiveAsync(BodyAsync).AsTask())
++            .ToArray();
++        await Task.WhenAll(tasks).ConfigureAwait(false);
++
++        Assert.That(overlapDetected, Is.False, "Two exclusive operations for the same player ran at the same time.");
++    }
++
++    /// <summary>
++    /// Verifies that re-entering the lock from within an already-held exclusive scope does not deadlock
++    /// (an inline save inside a packet handler is exactly this case).
++    /// </summary>
++    [Test]
++    public async Task ReentrantAccessDoesNotDeadlockAsync()
++    {
++        var player = await PlayerTestHelper.CreatePlayerAsync().ConfigureAwait(false);
++        var executed = 0;
++
++        var run = player.RunPersistenceExclusiveAsync(async () =>
++        {
++            Interlocked.Increment(ref executed);
++            await player.RunPersistenceExclusiveAsync(async () =>
++            {
++                Interlocked.Increment(ref executed);
++                await Task.Yield();
++            }).ConfigureAwait(false);
++        }).AsTask();
++
++        // If reentrancy deadlocked, this would hang; fail fast instead of blocking the suite.
++        await run.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
++
++        Assert.That(executed, Is.EqualTo(2));
++    }
++
++    /// <summary>
++    /// Verifies that a re-entrant exclusive operation still runs while another flow holds the lock:
++    /// the outer flow keeps the lock, an independent flow must wait, and the re-entrant call inside the
++    /// outer flow proceeds without waiting for itself.
++    /// </summary>
++    [Test]
++    public async Task IndependentFlowWaitsWhileLockIsHeldAsync()
++    {
++        var player = await PlayerTestHelper.CreatePlayerAsync().ConfigureAwait(false);
++        var otherEntered = false;
++        var holderHasLock = new TaskCompletionSource();
++        var mayRelease = new TaskCompletionSource();
++
++        // Holder runs on its own flow and keeps the lock until signalled.
++        var holder = Task.Run(() => player.RunPersistenceExclusiveAsync(async () =>
++        {
++            holderHasLock.SetResult();
++
++            // A re-entrant call from the holding flow must NOT block on the lock we already hold.
++            await player.RunPersistenceExclusiveAsync(() => ValueTask.CompletedTask).ConfigureAwait(false);
++
++            await mayRelease.Task.ConfigureAwait(false);
++        }).AsTask());
++
++        await holderHasLock.Task.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
++
++        // Competing flow started from an INDEPENDENT context (does not inherit the reentrancy flag).
++        var other = Task.Run(() => player.RunPersistenceExclusiveAsync(() =>
++        {
++            otherEntered = true;
++            return ValueTask.CompletedTask;
++        }).AsTask());
++
++        await Task.Delay(50).ConfigureAwait(false);
++        Assert.That(otherEntered, Is.False, "An independent flow entered while the lock was held.");
++
++        mayRelease.SetResult();
++        await holder.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
++        await other.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
++        Assert.That(otherEntered, Is.True, "The competing flow never ran after the lock was released.");
++    }
++}
