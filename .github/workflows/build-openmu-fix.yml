@@ -1,0 +1,75 @@
+name: Construir munique/openmu 0.9.10-fix
+
+# Construye la imagen del servidor OpenMU con el arreglo del guardado (PR 854) en un runner x86_64 de GitHub,
+# exactamente como lo hace scripts/10-construir-imagen.sh del paquete, pero sin cargar la maquina de Mundy.
+# Resultado: un Release con openmu-0.9.10-fix.tar.gz (docker save) y su sha256. En el servidor se carga con docker load.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: OpenMU commit d4ca915c + parche PR 854
+    runs-on: ubuntu-latest
+    steps:
+      - name: Receta y parche (este repositorio)
+        uses: actions/checkout@v4
+        with:
+          path: receta
+
+      - name: Codigo de OpenMU en el commit exacto de la imagen 0.9.10 del 26-07-2026
+        uses: actions/checkout@v4
+        with:
+          repository: MUnique/OpenMU
+          ref: d4ca915c442a56e267e3f01638822f367fa81082
+          path: OpenMU
+
+      - name: Comprobar version y aplicar el parche
+        working-directory: OpenMU
+        run: |
+          echo "commit base: $(git rev-parse HEAD)"
+          grep -q 'AssemblyVersion("0.9.10.0")' src/SharedAssemblyInfo.cs || { echo "el commit base no dice version 0.9.10" >&2; exit 1; }
+          git apply --check ../receta/openmu-0.9.10-fix-guardado.patch
+          git apply ../receta/openmu-0.9.10-fix-guardado.patch
+          git status --short
+          m=$(git status --short | grep -c '^ M ' || true); n=$(git status --short | grep -c '^?? ' || true)
+          [ "$m" = "4" ] && [ "$n" = "1" ] || { echo "esperaba 4 archivos modificados y 1 nuevo, hay $m y $n" >&2; exit 1; }
+          grep -q RunPersistenceExclusiveAsync src/GameLogic/Player.cs || { echo "el parche no quedo en Player.cs" >&2; exit 1; }
+
+      - name: Construir la imagen (mismo comando que el paquete)
+        working-directory: OpenMU/src
+        run: docker build -f Startup/Dockerfile -t munique/openmu:0.9.10-fix .
+
+      - name: Verificar la imagen
+        run: |
+          docker image inspect munique/openmu:0.9.10-fix --format 'id {{.Id}} creada {{.Created}} tamano {{.Size}} bytes arquitectura {{.Architecture}}'
+          [ "$(docker image inspect munique/openmu:0.9.10-fix --format '{{.Architecture}}')" = "amd64" ] || { echo "arquitectura inesperada" >&2; exit 1; }
+
+      - name: Empaquetar (docker save)
+        run: |
+          docker save munique/openmu:0.9.10-fix | gzip -6 > openmu-0.9.10-fix.tar.gz
+          sha256sum openmu-0.9.10-fix.tar.gz | tee sha256.txt
+          ls -l openmu-0.9.10-fix.tar.gz
+
+      - name: Publicar release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="openmu-0.9.10-fix-r${{ github.run_number }}"
+          {
+            echo "Imagen docker munique/openmu:0.9.10-fix = OpenMU en el commit d4ca915c442a56e267e3f01638822f367fa81082"
+            echo "(la misma base que la imagen oficial 0.9.10 del 26-07-2026) mas el parche del PR 854 (arreglo del guardado)."
+            echo
+            echo "Cargar en el servidor: docker load -i openmu-0.9.10-fix.tar.gz (queda con el nombre munique/openmu:0.9.10-fix)."
+            echo
+            echo "sha256:"
+            echo '```'
+            cat sha256.txt
+            echo '```'
+          } > notas.md
+          gh release create "$TAG" --repo "${{ github.repository }}" --title "munique/openmu:0.9.10-fix ($TAG)" --notes-file notas.md openmu-0.9.10-fix.tar.gz sha256.txt
