@@ -1,0 +1,179 @@
+diff --git a/src/GameLogic/Player.cs b/src/GameLogic/Player.cs
+index d6011e91..fe497345 100644
+--- a/src/GameLogic/Player.cs
++++ b/src/GameLogic/Player.cs
+@@ -1830,21 +1830,30 @@ public class Player : AsyncDisposable, IBucketMapObserver, IAttackable, IAttacke
+ 
+         await this.RemoveFromCurrentMapAsync().ConfigureAwait(false);
+ 
+-        await this.RestoreTemporaryStorageItemsAsync().ConfigureAwait(false);
++        // The remaining teardown mutates tracked entities (items of the temporary storages, the selected
++        // character, the magic effects) and ends with the final save. The periodic save runs on an
++        // independent timer flow; when it overlaps these mutations, it either persists a half-torn-down
++        // state or leaves the change tracker in a state which makes the final save fail (see the
++        // OpenMU issue 865). So the whole block runs under the persistence lock, which the inner save
++        // re-enters without deadlocking.
++        await this.RunPersistenceExclusiveAsync(async () =>
++        {
++            await this.RestoreTemporaryStorageItemsAsync().ConfigureAwait(false);
+ 
+-        this.OpenedNpc = null;
++            this.OpenedNpc = null;
+ 
+-        await this.SetSelectedCharacterAsync(null).ConfigureAwait(false);
+-        await this.MagicEffectList.ClearAllEffectsAsync().ConfigureAwait(false);
++            await this.SetSelectedCharacterAsync(null).ConfigureAwait(false);
++            await this.MagicEffectList.ClearAllEffectsAsync().ConfigureAwait(false);
+ 
+-        try
+-        {
+-            await this.SaveProgressAsync().ConfigureAwait(false);
+-        }
+-        catch (Exception ex)
+-        {
+-            this.Logger.LogError(ex, "Couldn't save when leaving the game. Player: {player}", this);
+-        }
++            try
++            {
++                await this.SaveProgressAsync().ConfigureAwait(false);
++            }
++            catch (Exception ex)
++            {
++                this.Logger.LogError(ex, "Couldn't save when leaving the game. Player: {player}", this);
++            }
++        }).ConfigureAwait(false);
+     }
+ 
+     /// <summary>
+diff --git a/src/Persistence/EntityFramework/EntityFrameworkContextBase.cs b/src/Persistence/EntityFramework/EntityFrameworkContextBase.cs
+index 4f1a71d3..110548ea 100644
+--- a/src/Persistence/EntityFramework/EntityFrameworkContextBase.cs
++++ b/src/Persistence/EntityFramework/EntityFrameworkContextBase.cs
+@@ -76,7 +76,9 @@ internal class EntityFrameworkContextBase : IContext
+         // instead of failing the whole save - which would otherwise leave the session unpersisted and
+         // roll the player back on relog.
+         const int maxAttempts = 3;
++        const int maxReconciliations = 5;
+         var attempt = 0;
++        var reconciliations = 0;
+         while (true)
+         {
+             attempt++;
+@@ -84,6 +86,30 @@ internal class EntityFrameworkContextBase : IContext
+             {
+                 return await this.SaveChangesCoreAsync(cancellationToken).ConfigureAwait(false);
+             }
++            catch (DbUpdateConcurrencyException ex)
++            {
++                // This model has no concurrency tokens, so "expected 1 row, affected 0" means that the
++                // row of a tracked entity is not in the database (anymore). Retrying alone can never
++                // succeed then: the change tracker keeps issuing the same command, so this save and
++                // every following save of this context fail, and the whole session is lost on relog.
++                // Reconciling the offending entries with the database lets the rest of the progress be
++                // persisted, and logs which entity caused it.
++                if (reconciliations < maxReconciliations
++                    && await this.TryReconcileStaleEntriesAsync(ex, cancellationToken).ConfigureAwait(false))
++                {
++                    reconciliations++;
++                    attempt--;
++                    continue;
++                }
++
++                if (attempt >= maxAttempts)
++                {
++                    throw;
++                }
++
++                this._logger.LogWarning(ex, "Transient concurrency conflict while saving (attempt {Attempt}/{MaxAttempts}); retrying.", attempt, maxAttempts);
++                await Task.Delay(attempt * 10, cancellationToken).ConfigureAwait(false);
++            }
+             catch (Exception ex) when (attempt < maxAttempts && IsTransientConcurrencyConflict(ex))
+             {
+                 this._logger.LogWarning(ex, "Transient concurrency conflict while saving (attempt {Attempt}/{MaxAttempts}); retrying.", attempt, maxAttempts);
+@@ -92,6 +118,86 @@ internal class EntityFrameworkContextBase : IContext
+         }
+     }
+ 
++    /// <summary>
++    /// Reconciles the entries of a <see cref="DbUpdateConcurrencyException"/> with the database, so the
++    /// save can be retried instead of failing forever with the same stale command.
++    /// </summary>
++    /// <remarks>
++    /// Deliberately conservative: nothing is written which was not there before.
++    /// <list type="bullet">
++    /// <item>Row is gone and the entry is a deletion: the deletion already happened somewhere else, so
++    /// the entry is just dropped.</item>
++    /// <item>Row is gone and the entry is an update: the entity was deleted by someone else. It is
++    /// detached (never re-inserted - that could resurrect a deleted item and duplicate it) and logged
++    /// with its type and key, so the cause can be tracked down.</item>
++    /// <item>Row exists: the regular optimistic concurrency case; the original values are refreshed
++    /// from the database and the in-memory state is kept.</item>
++    /// </list>
++    /// </remarks>
++    /// <param name="exception">The concurrency exception.</param>
++    /// <param name="cancellationToken">The cancellation token.</param>
++    /// <returns><c>true</c> if at least one entry was reconciled and the save should be retried.</returns>
++    private async ValueTask<bool> TryReconcileStaleEntriesAsync(DbUpdateConcurrencyException exception, CancellationToken cancellationToken)
++    {
++        var reconciled = false;
++        foreach (var entry in exception.Entries)
++        {
++            var description = DescribeEntry(entry);
++            try
++            {
++                var databaseValues = await entry.GetDatabaseValuesAsync(cancellationToken).ConfigureAwait(false);
++                if (databaseValues is not null)
++                {
++                    this._logger.LogWarning("Concurrency conflict while saving: {Entry} was changed in the database by someone else; keeping the in-memory state.", description);
++                    entry.OriginalValues.SetValues(databaseValues);
++                    reconciled = true;
++                    continue;
++                }
++
++                switch (entry.State)
++                {
++                    case EntityState.Deleted:
++                        this._logger.LogWarning("Concurrency conflict while saving: {Entry} was already deleted in the database; dropping the deletion.", description);
++                        entry.State = EntityState.Detached;
++                        reconciled = true;
++                        break;
++                    case EntityState.Modified:
++                        this._logger.LogError("Concurrency conflict while saving: the row of {Entry} does not exist in the database anymore, so its changes cannot be saved. Detaching it to save the rest of the progress.", description);
++                        entry.State = EntityState.Detached;
++                        reconciled = true;
++                        break;
++                    default:
++                        this._logger.LogError("Concurrency conflict while saving: {Entry} has no row in the database and an unexpected state; not reconciled.", description);
++                        break;
++                }
++            }
++            catch (Exception ex)
++            {
++                this._logger.LogWarning(ex, "Concurrency conflict while saving: could not reconcile {Entry}.", description);
++            }
++        }
++
++        return reconciled;
++    }
++
++    private static string DescribeEntry(EntityEntry entry)
++    {
++        try
++        {
++            var keyProperties = entry.Metadata.FindPrimaryKey()?.Properties
++                .Select(property => entry.Property(property.Name).CurrentValue?.ToString() ?? "null");
++            var keyText = keyProperties is null ? "?" : string.Join("/", keyProperties);
++            var foreignKeys = entry.Properties
++                .Where(property => property.Metadata.IsForeignKey())
++                .Select(property => $"{property.Metadata.Name}={property.CurrentValue?.ToString() ?? "null"}");
++            return $"{entry.Metadata.ClrType.Name} [{keyText}] ({entry.State}; {string.Join(", ", foreignKeys)})";
++        }
++        catch (Exception)
++        {
++            return entry.Metadata.ClrType.Name;
++        }
++    }
++
+     /// <summary>
+     /// Determines whether the exception is a transient conflict caused by a concurrent entity mutation
+     /// racing this save, and is therefore worth retrying.
