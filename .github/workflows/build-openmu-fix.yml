@@ -5,8 +5,7 @@ name: Construir munique/openmu 0.9.10-fix
 # Resultado: un Release con openmu-0.9.10-fix.tar.gz (docker save) y su sha256. En el servidor se carga con docker load.
 
 on:
-  push:
-    branches: [main]
+  workflow_dispatch:
   workflow_dispatch:
 
 permissions:
