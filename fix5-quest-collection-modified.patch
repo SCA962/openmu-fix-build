@@ -1,0 +1,36 @@
+Subject: [PATCH] Arreglar la excepcion al limpiar el estado de una mision
+
+QuestExtensions.ClearAsync recorre questState.RequirementStates con un foreach y
+dentro del bucle pide borrar cada elemento. DeleteAsync hace Context.Remove, y EF
+saca la entidad de la coleccion de navegacion del padre por correccion de
+relaciones. O sea, la coleccion se modifica mientras se esta recorriendo, y el
+enumerador lanza InvalidOperationException en el MoveNext siguiente.
+
+Es determinista: salta siempre que haya al menos un requisito.
+
+Verificado en produccion el 06-09-2026, tres veces en un minuto (05:38:15,
+05:38:36 y 05:38:43), desde los dos disparadores de uso normal: completar una
+mision (QuestCompletionAction) y empezar una (QuestStartAction, que limpia el
+estado anterior). Tambien lo dispara cancelarla (QuestCancelAction).
+
+Lo que queda roto sin el arreglo: las dos primeras lineas del metodo ya se han
+ejecutado, asi que la mision queda sin mision activa y con la bandera cambiada,
+la limpieza final nunca corre, y la coleccion se queda con entidades ya marcadas
+para borrar. La mision no se completa ni se inicia.
+
+El arreglo es recorrer una copia. Una llamada.
+
+--- a/src/GameLogic/PlayerActions/Quests/QuestExtensions.cs
++++ b/src/GameLogic/PlayerActions/Quests/QuestExtensions.cs
+@@ -19,7 +19,10 @@ public static class QuestExtensions
+     {
+         questState.ActiveQuest = null;
+         questState.ClientActionPerformed = false;
+-        foreach (var requirementState in questState.RequirementStates)
++
++        // Iterate a copy: DeleteAsync marks the entity as removed, and EF takes it out of this very
++        // collection by relationship fixup, which would invalidate the enumerator mid-loop.
++        foreach (var requirementState in questState.RequirementStates.ToList())
+         {
+             await persistenceContext.DeleteAsync(requirementState).ConfigureAwait(false);
+         }

@@ -1,0 +1,300 @@
+diff --git a/src/GameLogic/Player.cs b/src/GameLogic/Player.cs
+index d6011e91..91cc256a 100644
+--- a/src/GameLogic/Player.cs
++++ b/src/GameLogic/Player.cs
+@@ -69,6 +69,14 @@ public class Player : AsyncDisposable, IBucketMapObserver, IAttackable, IAttacke
+     /// </summary>
+     private readonly AsyncLocal<bool> _persistenceLockHeld = new();
+ 
++    /// <summary>
++    /// Number of progress saves which failed in a row for this player, without a successful one in
++    /// between. Once a save starts failing, the persistence context stays inconsistent and every
++    /// later save fails too, so the session silently stops being persisted; this counter lets the
++    /// periodic save notice that and end the session instead of letting it run into the void.
++    /// </summary>
++    private int _consecutiveSaveFailures;
++
+     private readonly Walker _walker;
+ 
+     private readonly AppearanceDataAdapter _appearanceData;
+@@ -1830,21 +1838,30 @@ public class Player : AsyncDisposable, IBucketMapObserver, IAttackable, IAttacke
+ 
+         await this.RemoveFromCurrentMapAsync().ConfigureAwait(false);
+ 
+-        await this.RestoreTemporaryStorageItemsAsync().ConfigureAwait(false);
++        // Everything below mutates entities tracked by this player's persistence context, and it ends
++        // with the final progress save. The periodic save runs on an independent timer flow, so
++        // without the lock it can be in the middle of its database round-trip while these mutations
++        // happen; the change tracker is left inconsistent and this save - and every later one - fails.
++        // That is OpenMU issue 865. The lock is re-entrant per flow, so the inner SaveProgressAsync
++        // does not deadlock on it.
++        await this.RunPersistenceExclusiveAsync(async () =>
++        {
++            await this.RestoreTemporaryStorageItemsAsync().ConfigureAwait(false);
+ 
+-        this.OpenedNpc = null;
++            this.OpenedNpc = null;
+ 
+-        await this.SetSelectedCharacterAsync(null).ConfigureAwait(false);
+-        await this.MagicEffectList.ClearAllEffectsAsync().ConfigureAwait(false);
++            await this.SetSelectedCharacterAsync(null).ConfigureAwait(false);
++            await this.MagicEffectList.ClearAllEffectsAsync().ConfigureAwait(false);
+ 
+-        try
+-        {
+-            await this.SaveProgressAsync().ConfigureAwait(false);
+-        }
+-        catch (Exception ex)
+-        {
+-            this.Logger.LogError(ex, "Couldn't save when leaving the game. Player: {player}", this);
+-        }
++            try
++            {
++                await this.SaveProgressAsync().ConfigureAwait(false);
++            }
++            catch (Exception ex)
++            {
++                this.Logger.LogError(ex, "Couldn't save when leaving the game. Player: {player}", this);
++            }
++        }).ConfigureAwait(false);
+     }
+ 
+     /// <summary>
+@@ -1859,11 +1876,28 @@ public class Player : AsyncDisposable, IBucketMapObserver, IAttackable, IAttacke
+             return true;
+         }
+ 
+-        return await this.RunPersistenceExclusiveAsync(
+-            () => this.PersistenceContext.SaveChangesAsync(cancellationToken),
+-            cancellationToken).ConfigureAwait(false);
++        try
++        {
++            var success = await this.RunPersistenceExclusiveAsync(
++                () => this.PersistenceContext.SaveChangesAsync(cancellationToken),
++                cancellationToken).ConfigureAwait(false);
++            Interlocked.Exchange(ref this._consecutiveSaveFailures, 0);
++            return success;
++        }
++        catch
++        {
++            Interlocked.Increment(ref this._consecutiveSaveFailures);
++            throw;
++        }
+     }
+ 
++    /// <summary>
++    /// Gets the number of progress saves which failed in a row, without a successful one in between.
++    /// A value greater than zero means this player's persistence context is in a state from which it
++    /// does not recover on its own, so nothing this session does is reaching the database.
++    /// </summary>
++    public int ConsecutiveSaveFailures => this._consecutiveSaveFailures;
++
+     /// <summary>
+     /// Runs the given operation while holding this player's persistence lock, so that context
+     /// mutations and progress saves for the player never run concurrently.
+diff --git a/src/GameLogic/PlugIns/PeriodicSaveProgressPlugIn.cs b/src/GameLogic/PlugIns/PeriodicSaveProgressPlugIn.cs
+index b31f85b4..499ae9b8 100644
+--- a/src/GameLogic/PlugIns/PeriodicSaveProgressPlugIn.cs
++++ b/src/GameLogic/PlugIns/PeriodicSaveProgressPlugIn.cs
+@@ -15,6 +15,14 @@ using MUnique.OpenMU.PlugIns;
+ [Guid("CEBBD5BD-B0DF-4768-816D-AF8DF78888B2")]
+ public class PeriodicSaveProgressPlugIn : IPeriodicTaskPlugIn, ISupportCustomConfiguration<PeriodicSaveProgressPlugInConfiguration>, ISupportDefaultCustomConfiguration
+ {
++    /// <summary>
++    /// Number of progress saves which may fail in a row before the player is disconnected.
++    /// Once a save starts failing, the persistence context does not recover on its own: every later
++    /// save fails too and the player keeps playing into the void, losing everything on relog. Ending
++    /// the session costs ten seconds and a fresh login starts from a clean context.
++    /// </summary>
++    private const int MaximumConsecutiveSaveFailures = 3;
++
+     private DateTime _nextRunUtc = DateTime.UtcNow;
+ 
+     /// <inheritdoc />
+@@ -56,6 +64,25 @@ public class PeriodicSaveProgressPlugIn : IPeriodicTaskPlugIn, ISupportCustomCon
+                 catch (Exception ex)
+                 {
+                     player.Logger.LogError(ex, "Error when saving the progress periodically for player '{player}': {ex}", player, ex);
++
++                    if (player.ConsecutiveSaveFailures >= MaximumConsecutiveSaveFailures)
++                    {
++                        player.Logger.LogError(
++                            "Disconnecting player '{player}' after {failures} progress saves failed in a row. Nothing this session does is reaching the database anymore, so staying online would keep discarding progress; a new login starts from a clean context.",
++                            player,
++                            player.ConsecutiveSaveFailures);
++
++                        try
++                        {
++                            await player.ShowBlueMessageAsync("Your progress cannot be saved right now. You are being disconnected so nothing more is lost - please log in again.").ConfigureAwait(false);
++                        }
++                        catch (Exception messageException)
++                        {
++                            player.Logger.LogDebug(messageException, "Could not tell the player why it gets disconnected; disconnecting anyway.");
++                        }
++
++                        await player.DisconnectAsync().ConfigureAwait(false);
++                    }
+                 }
+             }
+ 
+diff --git a/src/Persistence/EntityFramework/EntityFrameworkContextBase.cs b/src/Persistence/EntityFramework/EntityFrameworkContextBase.cs
+index 4f1a71d3..30e70fdd 100644
+--- a/src/Persistence/EntityFramework/EntityFrameworkContextBase.cs
++++ b/src/Persistence/EntityFramework/EntityFrameworkContextBase.cs
+@@ -84,36 +84,147 @@ internal class EntityFrameworkContextBase : IContext
+             {
+                 return await this.SaveChangesCoreAsync(cancellationToken).ConfigureAwait(false);
+             }
+-            catch (Exception ex) when (attempt < maxAttempts && IsTransientConcurrencyConflict(ex))
++            catch (DbUpdateConcurrencyException ex) when (attempt < maxAttempts)
+             {
+-                this._logger.LogWarning(ex, "Transient concurrency conflict while saving (attempt {Attempt}/{MaxAttempts}); retrying.", attempt, maxAttempts);
++                // A concurrency exception is NOT a lost update here: the model configures no
++                // concurrency token (no IsConcurrencyToken, IsRowVersion or xmin anywhere in
++                // OnModelCreating), so EF only reports it when the statement affected no row - the
++                // row this context still tracks is simply not in the database anymore. Repeating the
++                // same statement on the same dirty context can therefore never succeed, which is why
++                // a plain retry left the session broken until the server was restarted. Reconcile
++                // the affected entries against the database first, and only then retry.
++                if (!await this.TryReconcileStaleEntriesAsync(ex, cancellationToken).ConfigureAwait(false))
++                {
++                    throw;
++                }
++            }
++            catch (Exception ex) when (attempt < maxAttempts && IsTransientTrackerConflict(ex))
++            {
++                this._logger.LogWarning(ex, "Transient change tracker conflict while saving (attempt {Attempt}/{MaxAttempts}); retrying.", attempt, maxAttempts);
+                 await Task.Delay(attempt * 10, cancellationToken).ConfigureAwait(false);
+             }
+         }
+     }
+ 
++    /// <summary>
++    /// Tries to bring the entries reported by a <see cref="DbUpdateConcurrencyException"/> back in
++    /// line with the database, so that a following attempt writes against a clean state.
++    /// </summary>
++    /// <param name="exception">The exception reported by the failed save.</param>
++    /// <param name="cancellationToken">The cancellation token.</param>
++    /// <returns><c>true</c> if the save is worth retrying; <c>false</c> if the caller must give up.</returns>
++    /// <remarks>
++    /// Three cases, and the third one is the reason this method returns a value instead of always
++    /// cleaning up:
++    /// <list type="bullet">
++    /// <item>The row still exists - it just changed. The original values are rebased on the database
++    /// values, so the retry updates the current row instead of a stale snapshot.</item>
++    /// <item>The row is gone and the entry is <see cref="EntityState.Deleted"/> - deleting it was the
++    /// intention and somebody already did it (the crafting handler destroying a consumed item is the
++    /// common case). Dropping the entry is safe: there is nothing left to delete.</item>
++    /// <item>The row is gone and the entry is <see cref="EntityState.Modified"/> - detaching it would
++    /// leave the object alive in memory, and a later Attach (a trade, a storage move) could insert it
++    /// again as a new row. That is exactly how items get duplicated, so this method refuses to
++    /// "recover" and leaves the decision to the caller.</item>
++    /// </list>
++    /// </remarks>
++    private async ValueTask<bool> TryReconcileStaleEntriesAsync(DbUpdateConcurrencyException exception, CancellationToken cancellationToken)
++    {
++        if (exception.Entries.Count == 0)
++        {
++            // Without entries there is nothing to reconcile, and a retry would just repeat the same
++            // failing statement.
++            this._logger.LogError(exception, "Save failed with a concurrency conflict which reports no entries; not retrying.");
++            return false;
++        }
++
++        // The failing save released the context lock on its way out, so take it again: reconciling
++        // reads the change tracker and queries the database through the same context, and must not
++        // race another save on it.
++        using var l = await this._lock.LockAsync().ConfigureAwait(false);
++
++        var reconciled = false;
++        foreach (var entry in exception.Entries)
++        {
++            if (entry.State == EntityState.Added)
++            {
++                // An entry which is being inserted has no row to compare against by definition, so
++                // GetDatabaseValuesAsync would return null and the check below would wrongly treat it
++                // as unrecoverable. It rides along in the same command batch as the failing statement;
++                // once the others are reconciled, the retry inserts it normally.
++                continue;
++            }
++
++            var databaseValues = await entry.GetDatabaseValuesAsync(cancellationToken).ConfigureAwait(false);
++            if (databaseValues is not null)
++            {
++                entry.OriginalValues.SetValues(databaseValues);
++                this._logger.LogWarning("Save conflict resolved: {Entry} changed in the database; retrying against the current row.", DescribeEntry(entry));
++                reconciled = true;
++                continue;
++            }
++
++            if (entry.State == EntityState.Deleted)
++            {
++                this._logger.LogWarning("Save conflict resolved: {Entry} is already gone from the database; dropping the pending delete.", DescribeEntry(entry));
++                entry.State = EntityState.Detached;
++                reconciled = true;
++                continue;
++            }
++
++            this._logger.LogError("Save conflict NOT resolvable: {Entry} no longer exists in the database. Leaving it attached on purpose - detaching it could resurrect a deleted row as a duplicate later on.", DescribeEntry(entry));
++            return false;
++        }
++
++        return reconciled;
++    }
++
++    /// <summary>
++    /// Describes an entry for the log: which entity it is, its key, its state and its foreign keys.
++    /// Without this, a concurrency failure only says "expected to affect 1 row(s)" and gives no clue
++    /// about which game action deleted the row.
++    /// </summary>
++    /// <param name="entry">The entry to describe.</param>
++    /// <returns>A one line description.</returns>
++    private static string DescribeEntry(EntityEntry entry)
++    {
++        var primaryKey = entry.Metadata.FindPrimaryKey();
++        var keyText = primaryKey is null
++            ? "no key"
++            : string.Join(", ", primaryKey.Properties.Select(property => $"{property.Name}={entry.Property(property.Name).CurrentValue}"));
++        var foreignKeys = entry.Metadata.GetForeignKeys()
++            .SelectMany(foreignKey => foreignKey.Properties)
++            .Select(property => $"{property.Name}={entry.Property(property.Name).CurrentValue}")
++            .Distinct()
++            .ToList();
++        var foreignKeyText = foreignKeys.Count == 0 ? string.Empty : $", fk: {string.Join(", ", foreignKeys)}";
++        return $"{entry.Entity.GetType().Name} ({keyText}, state: {entry.State}{foreignKeyText})";
++    }
++
+     /// <summary>
+     /// Determines whether the exception is a transient conflict caused by a concurrent entity mutation
+     /// racing this save, and is therefore worth retrying.
+     /// </summary>
+     /// <param name="exception">The exception thrown by the save.</param>
+     /// <returns><c>true</c> if the save should be retried.</returns>
+-    private static bool IsTransientConcurrencyConflict(Exception exception)
++    private static bool IsTransientTrackerConflict(Exception exception)
+     {
+         // A concurrent entity mutation racing this save corrupts the change tracker mid-enumeration.
+         // Depending on exactly where change detection was, it surfaces as one of several types - a
+         // modified collection (InvalidOperationException), a transiently-null internal key
+-        // (ArgumentNullException/NullReferenceException), or an out-of-range index. All are transient:
++        // (ArgumentNullException), or an out-of-range index. All are transient:
+         // the racing mutation is a single quick operation, so a bounded retry lands on a stable moment.
+         // A genuinely persistent error of the same type is not masked - it rethrows once the retries
+         // are exhausted. The deterministic serialization (per-player persistence lock) is the primary
+         // guard; this retry only needs to absorb the rare, bursty sources that lock isn't held for.
+-        return exception is DbUpdateConcurrencyException
+-            or InvalidOperationException
++        // DbUpdateConcurrencyException is deliberately NOT in this list: with no concurrency token
++        // configured it always means "the row is gone", which a retry can never fix. It is handled by
++        // TryReconcileStaleEntriesAsync instead. NullReferenceException and KeyNotFoundException are
++        // out as well - they are far more often a real bug than a tracker race, and retrying them
++        // three times only buries the stack trace under duplicated log lines.
++        return exception is InvalidOperationException
+             or ArgumentNullException
+-            or NullReferenceException
+-            or IndexOutOfRangeException
+-            or KeyNotFoundException;
++            or IndexOutOfRangeException;
+     }
+ 
+     private async ValueTask<bool> SaveChangesCoreAsync(CancellationToken cancellationToken)

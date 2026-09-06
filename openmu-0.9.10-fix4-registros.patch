@@ -1,0 +1,227 @@
+diff --git a/src/GameLogic/Player.cs b/src/GameLogic/Player.cs
+index 91cc256a..d6ee44c3 100644
+--- a/src/GameLogic/Player.cs
++++ b/src/GameLogic/Player.cs
+@@ -1829,6 +1829,20 @@ public class Player : AsyncDisposable, IBucketMapObserver, IAttackable, IAttacke
+     /// </summary>
+     public async ValueTask RemoveFromGameAsync()
+     {
++        // The character name has to be captured here: SetSelectedCharacterAsync(null) below clears it,
++        // so the closing line would otherwise not be able to say who left. Without these two lines a
++        // character switch leaves no trace at all in the log, which is why the exit flow running twice
++        // without a disconnect could only be inferred and not read.
++        var exitCharacterName = this.SelectedCharacter?.Name ?? "(none)";
++        var exitAccountName = this.Account?.LoginName ?? "(none)";
++        var exitSaveSucceeded = false;
++        this.Logger.LogInformation(
++            "EXIT-FLOW start: account [{Account}], character [{Character}], state {State}, consecutive save failures {Failures}.",
++            exitAccountName,
++            exitCharacterName,
++            this.PlayerState.CurrentState,
++            this._consecutiveSaveFailures);
++
+         if (this.Party is { } party)
+         {
+             await party.LeaveTemporarilyAsync(this).ConfigureAwait(false);
+@@ -1855,13 +1869,20 @@ public class Player : AsyncDisposable, IBucketMapObserver, IAttackable, IAttacke
+ 
+             try
+             {
+-                await this.SaveProgressAsync().ConfigureAwait(false);
++                exitSaveSucceeded = await this.SaveProgressAsync().ConfigureAwait(false);
+             }
+             catch (Exception ex)
+             {
+                 this.Logger.LogError(ex, "Couldn't save when leaving the game. Player: {player}", this);
+             }
+         }).ConfigureAwait(false);
++
++        this.Logger.LogInformation(
++            "EXIT-FLOW end: account [{Account}], character [{Character}], final save succeeded {Saved}, consecutive save failures {Failures}.",
++            exitAccountName,
++            exitCharacterName,
++            exitSaveSucceeded,
++            this._consecutiveSaveFailures);
+     }
+ 
+     /// <summary>
+diff --git a/src/GameLogic/PlayerActions/LoginAction.cs b/src/GameLogic/PlayerActions/LoginAction.cs
+index 8dea1629..d6799464 100644
+--- a/src/GameLogic/PlayerActions/LoginAction.cs
++++ b/src/GameLogic/PlayerActions/LoginAction.cs
+@@ -1,4 +1,4 @@
+-// <copyright file="LoginAction.cs" company="MUnique">
++﻿// <copyright file="LoginAction.cs" company="MUnique">
+ // Licensed under the MIT License. See LICENSE file in the project root for full license information.
+ // </copyright>
+ 
+@@ -115,6 +115,9 @@ public class LoginAction
+                 var isTemplateOffline = offlinePlayer!.IsTemplatePlayer;
+                 if (!isTemplateOffline && !await gameServerContext.LoginServer.TryLoginAsync(username, gameServerContext.Id).ConfigureAwait(false))
+                 {
++                    player.Logger.LogWarning(
++                        "LOGIN rejected, reason 'login server says already connected', offline-session path: [{Username}].",
++                        username);
+                     context.Allowed = false;
+                     await player.InvokeViewPlugInAsync<IShowLoginResultPlugIn>(p => p.ShowLoginResultAsync(LoginResult.AccountAlreadyConnected)).ConfigureAwait(false);
+                     await gameServerContext.EventPublisher.PlayerAlreadyLoggedInAsync(gameServerContext.Id, username).ConfigureAwait(false);
+@@ -147,6 +150,12 @@ public class LoginAction
+ 
+             if (!loadedAccount.IsTemplate && !await gameServerContext.LoginServer.TryLoginAsync(username, gameServerContext.Id).ConfigureAwait(false))
+             {
++                // This is the path worth watching: the account was ALREADY loaded into this player's
++                // persistence context on the line above, and the rejection happens afterwards without
++                // detaching it. If rollbacks keep happening after the exit-flow fix, look here first.
++                player.Logger.LogWarning(
++                    "LOGIN rejected, reason 'login server says already connected', AFTER the account was loaded into this context: [{Username}]. The loaded account stays tracked.",
++                    username);
+                 context.Allowed = false;
+                 await player.InvokeViewPlugInAsync<IShowLoginResultPlugIn>(p => p.ShowLoginResultAsync(LoginResult.AccountAlreadyConnected)).ConfigureAwait(false);
+                 await gameServerContext.EventPublisher.PlayerAlreadyLoggedInAsync(gameServerContext.Id, username).ConfigureAwait(false);
+@@ -191,6 +200,10 @@ public class LoginAction
+     {
+         var result = player.LoginResultOverride ?? LoginResult.AccountAlreadyConnected;
+         player.LoginResultOverride = null;
++        player.Logger.LogWarning(
++            "LOGIN rejected, reason 'state machine refused the advance to Authenticated': [{Username}], answer {Result}. No account was loaded on this path.",
++            username,
++            result);
+         await player.InvokeViewPlugInAsync<IShowLoginResultPlugIn>(p => p.ShowLoginResultAsync(result)).ConfigureAwait(false);
+         if (player.GameContext is IGameServerContext gameServerContext)
+         {
+diff --git a/src/GameLogic/PlayerActions/LogoutAction.cs b/src/GameLogic/PlayerActions/LogoutAction.cs
+index 7a69bb62..c45bce30 100644
+--- a/src/GameLogic/PlayerActions/LogoutAction.cs
++++ b/src/GameLogic/PlayerActions/LogoutAction.cs
+@@ -18,6 +18,16 @@ public class LogoutAction
+     /// <param name="logoutType">Type of the logout.</param>
+     public async ValueTask LogoutAsync(Player player, LogoutType logoutType)
+     {
++        // This is the only place which knows WHY the exit flow runs. BackToCharacterSelection and
++        // Timeout run the whole flow without closing the connection, so the same session goes through
++        // it more than once; today that is invisible in the log and can only be inferred from the
++        // absence of a new connection.
++        player.Logger.LogInformation(
++            "LOGOUT requested: account [{Account}], character [{Character}], type {LogoutType}.",
++            player.Account?.LoginName ?? "(none)",
++            player.SelectedCharacter?.Name ?? "(none)",
++            logoutType);
++
+         await player.RemoveFromGameAsync().ConfigureAwait(false);
+ 
+         if (logoutType == LogoutType.CloseGame)
+diff --git a/src/GameLogic/PlayerActions/Trade/TradeAcceptAction.cs b/src/GameLogic/PlayerActions/Trade/TradeAcceptAction.cs
+index 472cf518..66597593 100644
+--- a/src/GameLogic/PlayerActions/Trade/TradeAcceptAction.cs
++++ b/src/GameLogic/PlayerActions/Trade/TradeAcceptAction.cs
+@@ -64,6 +64,12 @@ public class TradeAcceptAction : BaseTradeAction
+     internal async ValueTask OpenTradeAsync(ITrader trader)
+     {
+         // first make sure that all items which could be transferred are already present in the database
++        // Note for the log reader: this save goes through Player.SaveProgressAsync, so a trade opened
++        // on a poisoned session counts towards the consecutive-failure counter as well.
++        trader.Logger.LogInformation(
++            "TRADE opened for [{Trader}] with partner [{Partner}].",
++            trader.Name,
++            trader.TradingPartner?.Name ?? "(none)");
+         await trader.SaveProgressAsync().ConfigureAwait(false);
+ 
+         trader.BackupInventory = new BackupItemStorage(trader.Inventory!.ItemStorage);
+diff --git a/src/GameLogic/PlayerActions/Trade/TradeButtonAction.cs b/src/GameLogic/PlayerActions/Trade/TradeButtonAction.cs
+index 24bc0213..4e9c838c 100644
+--- a/src/GameLogic/PlayerActions/Trade/TradeButtonAction.cs
++++ b/src/GameLogic/PlayerActions/Trade/TradeButtonAction.cs
+@@ -35,6 +35,11 @@ public class TradeButtonAction : BaseTradeAction
+             && tradingPartner.PlayerState.CurrentState == PlayerState.TradeButtonPressed)
+         {
+             TradeResult result = await this.InternalFinishTradeAsync(trader, tradingPartner).ConfigureAwait(false);
++            (trader as Player)?.Logger.LogInformation(
++                "TRADE finished between [{Trader}] and [{Partner}] with result {Result}.",
++                trader.Name,
++                tradingPartner.Name,
++                result);
+             if (result != TradeResult.Success)
+             {
+                 await this.CancelTradeAsync(tradingPartner, false).ConfigureAwait(false);
+@@ -93,6 +98,18 @@ public class TradeButtonAction : BaseTradeAction
+ 
+         try
+         {
++            // The narrow window that matters: from here to the Attach calls below, the items belong to
++            // no player context. If the process, the connection or a save of either player lands in
++            // between, this is where an item goes missing or comes back twice. Today it writes nothing.
++            (trader as Player)?.Logger.LogInformation(
++                "TRADE committing in the separate trade context: [{Trader}] hands over {TraderItems} item(s) and {TraderMoney} money, [{Partner}] hands over {PartnerItems} item(s) and {PartnerMoney} money.",
++                trader.Name,
++                traderItems.Count,
++                trader.TradingMoney,
++                tradingPartner.Name,
++                tradePartnerItems.Count,
++                tradingPartner.TradingMoney);
++
+             this.DetachItemsFromPersistenceContext(traderItems, trader.PersistenceContext);
+             this.DetachItemsFromPersistenceContext(tradePartnerItems, trader.TradingPartner!.PersistenceContext);
+             await itemContext.SaveChangesAsync().ConfigureAwait(false);
+diff --git a/src/Persistence/EntityFramework/EntityFrameworkContextBase.cs b/src/Persistence/EntityFramework/EntityFrameworkContextBase.cs
+index 30e70fdd..08c6eaea 100644
+--- a/src/Persistence/EntityFramework/EntityFrameworkContextBase.cs
++++ b/src/Persistence/EntityFramework/EntityFrameworkContextBase.cs
+@@ -134,7 +134,7 @@ internal class EntityFrameworkContextBase : IContext
+         {
+             // Without entries there is nothing to reconcile, and a retry would just repeat the same
+             // failing statement.
+-            this._logger.LogError(exception, "Save failed with a concurrency conflict which reports no entries; not retrying.");
++            this._logger.LogError(exception, "Save failed with a concurrency conflict which reports no entries; not retrying. Tracked entries in this context: {TrackedEntries}.", this.CountTrackedEntriesSafely());
+             return false;
+         }
+ 
+@@ -172,13 +172,48 @@ internal class EntityFrameworkContextBase : IContext
+                 continue;
+             }
+ 
+-            this._logger.LogError("Save conflict NOT resolvable: {Entry} no longer exists in the database. Leaving it attached on purpose - detaching it could resurrect a deleted row as a duplicate later on.", DescribeEntry(entry));
++            this._logger.LogError("Save conflict NOT resolvable: {Entry} no longer exists in the database. Leaving it attached on purpose - detaching it could resurrect a deleted row as a duplicate later on. Tracked entries in this context: {TrackedEntries}.", DescribeEntry(entry), this.CountTrackedEntriesSafely());
+             return false;
+         }
+ 
+         return reconciled;
+     }
+ 
++    /// <summary>
++    /// Counts the entities tracked by this context, for the log. A context which is failing to save
++    /// and tracks thousands of entities is a different problem from one which tracks a handful, and
++    /// today the failure line says nothing about it. This adds no log line of its own: it only fills
++    /// a placeholder in a line which is already written when a save gives up.
++    /// </summary>
++    /// <returns>The number of tracked entries, or -1 if the tracker could not be read.</returns>
++    /// <remarks>
++    /// Enumerating the change tracker normally runs change detection, which is exactly the operation
++    /// that throws when another flow mutates a tracked collection at the same time - and this runs on
++    /// a path where the context is already known to be unhealthy. Detection is therefore switched off
++    /// around the count (so the call cannot mutate tracker state either), and any failure returns -1
++    /// instead of replacing the real exception with a logging one.
++    /// </remarks>
++    private int CountTrackedEntriesSafely()
++    {
++        try
++        {
++            var autoDetectChanges = this.Context.ChangeTracker.AutoDetectChangesEnabled;
++            this.Context.ChangeTracker.AutoDetectChangesEnabled = false;
++            try
++            {
++                return this.Context.ChangeTracker.Entries().Count();
++            }
++            finally
++            {
++                this.Context.ChangeTracker.AutoDetectChangesEnabled = autoDetectChanges;
++            }
++        }
++        catch
++        {
++            return -1;
++        }
++    }
++
+     /// <summary>
+     /// Describes an entry for the log: which entity it is, its key, its state and its foreign keys.
+     /// Without this, a concurrency failure only says "expected to affect 1 row(s)" and gives no clue

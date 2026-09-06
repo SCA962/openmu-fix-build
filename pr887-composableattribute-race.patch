@@ -1,0 +1,635 @@
+diff --git a/src/AttributeSystem/AttributeRelationshipElement.cs b/src/AttributeSystem/AttributeRelationshipElement.cs
+index 5817e933..25a54bc4 100644
+--- a/src/AttributeSystem/AttributeRelationshipElement.cs
++++ b/src/AttributeSystem/AttributeRelationshipElement.cs
+@@ -10,6 +10,15 @@ namespace MUnique.OpenMU.AttributeSystem;
+ /// </summary>
+ public class AttributeRelationshipElement : SimpleElement
+ {
++    /// <summary>
++    /// Serializes the <see cref="_version"/> bump with the guarded cache write, so a recalculation that
++    /// races a concurrent input change (e.g. an input attribute whose element is removed when a magic
++    /// effect expires) cannot latch its stale result into <see cref="_cachedValue"/>.
++    /// </summary>
++    private readonly object _cacheLock = new();
++
++    private long _version;
++
+     private float? _cachedValue;
+ 
+     /// <summary>
+@@ -55,14 +64,40 @@ public class AttributeRelationshipElement : SimpleElement
+ 
+     private void ElementChanged(object? sender, EventArgs eventArgs)
+     {
+-        this._cachedValue = null;
++        lock (this._cacheLock)
++        {
++            this._version++;
++            this._cachedValue = null;
++        }
++
+         this.RaiseValueChanged();
+     }
+ 
+     private float GetAndCacheValue()
+     {
+-        this._cachedValue = this.CalculateValue();
+-        return this._cachedValue.Value;
++        // Return the freshly computed value rather than re-reading the field: a concurrent ElementChanged
++        // (e.g. from an input attribute whose element is removed when a magic effect expires) can reset
++        // _cachedValue to null between the assignment and the read, which would make _cachedValue.Value
++        // throw an InvalidOperationException. The version captured before calculating guards the cache
++        // write: if an input changed while CalculateValue was running, the fresh value is still returned
++        // to this caller but not cached, so the lost update cannot latch a stale value.
++        long versionAtStart;
++        lock (this._cacheLock)
++        {
++            versionAtStart = this._version;
++        }
++
++        var value = this.CalculateValue();
++
++        lock (this._cacheLock)
++        {
++            if (this._version == versionAtStart)
++            {
++                this._cachedValue = value;
++            }
++        }
++
++        return value;
+     }
+ 
+     private float CalculateValue()
+diff --git a/src/AttributeSystem/AttributeSystem.cs b/src/AttributeSystem/AttributeSystem.cs
+index a8d43d6b..4d11f779 100644
+--- a/src/AttributeSystem/AttributeSystem.cs
++++ b/src/AttributeSystem/AttributeSystem.cs
+@@ -13,6 +13,17 @@ public class AttributeSystem : IAttributeSystem, IEnumerable<IAttribute>
+ {
+     private readonly IDictionary<AttributeDefinition, IAttribute> _attributes = new Dictionary<AttributeDefinition, IAttribute>();
+ 
++    /// <summary>
++    /// Synchronizes every access to <see cref="_attributes"/>. The dictionary is read on the game logic
++    /// thread (damage calculations, stat lookups) while an attribute can be removed from a thread pool
++    /// thread when a magic effect expires on its timer (see <see cref="RemoveElement"/>). Concurrent
++    /// mutation of a plain <see cref="Dictionary{TKey,TValue}"/> during reads is undefined - wrong
++    /// results, exceptions, or an infinite spin inside a resizing lookup. Only the dictionary operations
++    /// are guarded; element aggregation and value-changed dispatch run outside this lock, so it never
++    /// nests into another attribute system's lock and cannot deadlock.
++    /// </summary>
++    private readonly object _attributesLock = new();
++
+     /// <summary>
+     /// Initializes a new instance of the <see cref="AttributeSystem" /> class.
+     /// </summary>
+@@ -86,8 +97,13 @@ public class AttributeSystem : IAttributeSystem, IEnumerable<IAttribute>
+             return false;
+         }
+ 
+-        if (this._attributes.TryGetValue(attributeDefinition, out var attribute)
+-            && attribute is StatAttribute statAttribute)
++        IAttribute? attribute;
++        lock (this._attributesLock)
++        {
++            this._attributes.TryGetValue(attributeDefinition, out attribute);
++        }
++
++        if (attribute is StatAttribute statAttribute)
+         {
+             statAttribute.Value = newValue;
+ 
+@@ -128,39 +144,62 @@ public class AttributeSystem : IAttributeSystem, IEnumerable<IAttribute>
+     /// <inheritdoc/>
+     public void AddElement(IElement element, AttributeDefinition targetAttribute)
+     {
+-        if (!this._attributes.TryGetValue(targetAttribute, out var attribute))
++        // The get-or-create is atomic under the lock so two threads racing the first add of the same
++        // attribute cannot both create it (which would make the second Dictionary.Add throw). The
++        // element is then added - and its ValueChanged dispatched - outside the lock, so the lock is
++        // never held across a call that could reach another attribute system's lock.
++        IComposableAttribute composableAttribute;
++        ComposableAttribute? created = null;
++        lock (this._attributesLock)
+         {
+-            attribute = new ComposableAttribute(targetAttribute);
+-            this._attributes.Add(targetAttribute, attribute);
+-            this.OnAttributeAdded(attribute);
++            if (this._attributes.TryGetValue(targetAttribute, out var attribute))
++            {
++                composableAttribute = attribute as IComposableAttribute
++                    ?? throw new ArgumentException($"Attribute {targetAttribute} is not a composable attribute.");
++            }
++            else
++            {
++                var composable = new ComposableAttribute(targetAttribute);
++                this._attributes.Add(targetAttribute, composable);
++                composableAttribute = composable;
++                created = composable;
++            }
+         }
+ 
+-        if (attribute is IComposableAttribute composableAttribute)
+-        {
+-            composableAttribute.AddElement(element);
+-        }
+-        else
++        if (created is not null)
+         {
+-            throw new ArgumentException($"Attribute {targetAttribute} is not a composable attribute.");
++            this.OnAttributeAdded(created);
+         }
++
++        composableAttribute.AddElement(element);
+     }
+ 
+     /// <inheritdoc/>
+     public void RemoveElement(IElement element, AttributeDefinition targetAttribute)
+     {
+-        if (this._attributes.TryGetValue(targetAttribute, out var attribute))
++        IComposableAttribute composableAttribute;
++        lock (this._attributesLock)
+         {
+-            if (attribute is IComposableAttribute composableAttribute)
++            if (!this._attributes.TryGetValue(targetAttribute, out var attribute))
+             {
+-                composableAttribute.RemoveElement(element);
+-                if (!composableAttribute.Elements.Any())
+-                {
+-                    this._attributes.Remove(targetAttribute);
+-                }
++                return;
+             }
+-            else
++
++            composableAttribute = attribute as IComposableAttribute
++                ?? throw new ArgumentException($"Attribute {targetAttribute} is not a composable attribute.");
++        }
++
++        composableAttribute.RemoveElement(element);
++
++        lock (this._attributesLock)
++        {
++            // Only drop the attribute when it is still empty and still the very instance we just mutated,
++            // so a concurrent AddElement that repopulated it does not get its element discarded (TOCTOU).
++            if (!composableAttribute.Elements.Any()
++                && this._attributes.TryGetValue(targetAttribute, out var current)
++                && ReferenceEquals(current, composableAttribute))
+             {
+-                throw new ArgumentException($"Attribute {targetAttribute} is not a composable attribute.");
++                this._attributes.Remove(targetAttribute);
+             }
+         }
+     }
+@@ -168,15 +207,16 @@ public class AttributeSystem : IAttributeSystem, IEnumerable<IAttribute>
+     /// <inheritdoc/>
+     public override string ToString()
+     {
++        var snapshot = this.GetAttributeSnapshot();
+         var stringBuilder = new StringBuilder();
+         stringBuilder.AppendLine("Stat Attributes:");
+-        foreach (var statAttribute in this._attributes.Values.OfType<StatAttribute>())
++        foreach (var statAttribute in snapshot.OfType<StatAttribute>())
+         {
+             stringBuilder.AppendLine($"  {statAttribute.Definition}: {statAttribute.Value}");
+         }
+ 
+         stringBuilder.AppendLine("Others:");
+-        foreach (var attribute in this._attributes.Values.OfType<IComposableAttribute>())
++        foreach (var attribute in snapshot.OfType<IComposableAttribute>())
+         {
+             stringBuilder.AppendLine($"  {attribute.Definition}: {attribute.Value}");
+         }
+@@ -187,7 +227,7 @@ public class AttributeSystem : IAttributeSystem, IEnumerable<IAttribute>
+     /// <inheritdoc />
+     public IEnumerator<IAttribute> GetEnumerator()
+     {
+-        return this._attributes.Values.GetEnumerator();
++        return ((IEnumerable<IAttribute>)this.GetAttributeSnapshot()).GetEnumerator();
+     }
+ 
+     /// <inheritdoc />
+@@ -203,13 +243,26 @@ public class AttributeSystem : IAttributeSystem, IEnumerable<IAttribute>
+     /// <returns>The element of the attribute.</returns>
+     public IElement GetOrCreateAttribute(AttributeDefinition attributeDefinition)
+     {
+-        var element = this.GetAttribute(attributeDefinition);
+-        if (element is null)
++        IElement element;
++        ComposableAttribute? created = null;
++        lock (this._attributesLock)
++        {
++            if (this._attributes.TryGetValue(attributeDefinition, out var existing))
++            {
++                element = existing;
++            }
++            else
++            {
++                var composableAttribute = new ComposableAttribute(attributeDefinition);
++                this._attributes.Add(attributeDefinition, composableAttribute);
++                element = composableAttribute;
++                created = composableAttribute;
++            }
++        }
++
++        if (created is not null)
+         {
+-            var composableAttribute = new ComposableAttribute(attributeDefinition);
+-            element = composableAttribute;
+-            this._attributes.Add(attributeDefinition, composableAttribute);
+-            this.OnAttributeAdded(composableAttribute);
++            this.OnAttributeAdded(created);
+         }
+ 
+         return element;
+@@ -249,11 +302,17 @@ public class AttributeSystem : IAttributeSystem, IEnumerable<IAttribute>
+             return null;
+         }
+ 
+-        if (this._attributes.TryGetValue(attributeDefinition, out var attribute))
++        lock (this._attributesLock)
+         {
+-            return attribute;
++            return this._attributes.TryGetValue(attributeDefinition, out var attribute) ? attribute : null;
+         }
++    }
+ 
+-        return null;
++    private IAttribute[] GetAttributeSnapshot()
++    {
++        lock (this._attributesLock)
++        {
++            return this._attributes.Values.ToArray();
++        }
+     }
+ }
+\ No newline at end of file
+diff --git a/src/AttributeSystem/ComposableAttribute.cs b/src/AttributeSystem/ComposableAttribute.cs
+index 1d5cd033..0f27f78f 100644
+--- a/src/AttributeSystem/ComposableAttribute.cs
++++ b/src/AttributeSystem/ComposableAttribute.cs
+@@ -9,7 +9,32 @@ namespace MUnique.OpenMU.AttributeSystem;
+ /// </summary>
+ public class ComposableAttribute : BaseAttribute, IComposableAttribute
+ {
+-    private readonly IList<IElement> _elementList;
++    /// <summary>
++    /// Serializes the copy-on-write mutations of <see cref="_elements"/>, the element subscription
++    /// changes and the <see cref="_version"/> bump. Elements are usually added on the game logic thread,
++    /// but they can also be removed from a thread pool thread when a magic effect expires on its timer,
++    /// while a value recalculation is aggregating at the same time. The cached fast path of
++    /// <see cref="Value"/> and the <see cref="Elements"/> getter are lock-free (a single volatile read of
++    /// <see cref="_elements"/>); on a cache miss, <see cref="GetAndCacheValue"/> takes this lock only
++    /// briefly to capture a consistent (snapshot, version) pair and again to write the cache, and does the
++    /// aggregation itself outside the lock on the immutable snapshot.
++    /// </summary>
++    private readonly object _elementLock = new();
++
++    /// <summary>
++    /// The elements this attribute is composed of. Treated as immutable: mutations replace the whole
++    /// array under <see cref="_elementLock"/> (copy-on-write), so a reader that captured the reference
++    /// can keep enumerating it safely while another thread adds or removes an element.
++    /// </summary>
++    private volatile IElement[] _elements = [];
++
++    /// <summary>
++    /// Incremented under <see cref="_elementLock"/> on every structural change or cache invalidation.
++    /// <see cref="GetAndCacheValue"/> captures it before aggregating and only writes the result back into
++    /// <see cref="_cachedValue"/> when it is still unchanged, so a recalculation that raced a concurrent
++    /// removal cannot latch a stale value into the cache.
++    /// </summary>
++    private long _version;
+ 
+     private float? _maximumValue;
+ 
+@@ -24,12 +49,16 @@ public class ComposableAttribute : BaseAttribute, IComposableAttribute
+     public ComposableAttribute(AttributeDefinition definition, AggregateType aggregateType = AggregateType.AddRaw, float? maximumValue = null)
+         : base(definition, aggregateType)
+     {
+-        this._elementList = new List<IElement>();
+         this._maximumValue = maximumValue;
+     }
+ 
+     /// <inheritdoc/>
+-    public IEnumerable<IElement> Elements => this._elementList;
++    /// <remarks>
++    /// Returns the current copy-on-write snapshot of the elements. It is detached from later mutations on
++    /// purpose, so the caller can enumerate it safely even while elements are concurrently added or
++    /// removed; a previously obtained sequence will not reflect subsequent changes.
++    /// </remarks>
++    public IEnumerable<IElement> Elements => this._elements;
+ 
+     /// <inheritdoc/>
+     public override float Value => this._cachedValue ?? this.GetAndCacheValue();
+@@ -37,8 +66,16 @@ public class ComposableAttribute : BaseAttribute, IComposableAttribute
+     /// <inheritdoc/>
+     public IComposableAttribute AddElement(IElement element)
+     {
+-        this._elementList.Add(element);
+-        element.ValueChanged += this.ElementChanged;
++        lock (this._elementLock)
++        {
++            this._elements = [.. this._elements, element];
++
++            // Subscribing inside the lock keeps a concurrent Add/Remove of the same element from
++            // interleaving into a live subscription on an element that is no longer in the list. It does
++            // not call into user code, so it is safe to hold the lock across it.
++            element.ValueChanged += this.ElementChanged;
++        }
++
+         this.ElementChanged(element, EventArgs.Empty);
+ 
+         return this;
+@@ -47,28 +84,63 @@ public class ComposableAttribute : BaseAttribute, IComposableAttribute
+     /// <inheritdoc/>
+     public void RemoveElement(IElement element)
+     {
+-        if (this._elementList.Remove(element))
++        bool removed;
++        lock (this._elementLock)
++        {
++            var index = Array.IndexOf(this._elements, element);
++            removed = index >= 0;
++            if (removed)
++            {
++                var newElements = new IElement[this._elements.Length - 1];
++                Array.Copy(this._elements, 0, newElements, 0, index);
++                Array.Copy(this._elements, index + 1, newElements, index, this._elements.Length - index - 1);
++                this._elements = newElements;
++                element.ValueChanged -= this.ElementChanged;
++            }
++        }
++
++        if (removed)
+         {
+-            element.ValueChanged -= this.ElementChanged;
+             this.ElementChanged(element, EventArgs.Empty);
+         }
+     }
+ 
+     private float GetAndCacheValue()
+     {
+-        if (this._elementList.Count == 0)
++        // Aggregate a copy-on-write snapshot, so a concurrent AddElement/RemoveElement (e.g. an expiring
++        // magic effect on a timer thread) cannot tear the list. The version captured alongside the
++        // snapshot guards the cache write below: if anything changed the composition or invalidated the
++        // cache while this recomputation was running, the freshly computed value is still returned to this
++        // caller, but it is not written back - otherwise the lost update would latch a stale value into
++        // _cachedValue until some unrelated element change happened to invalidate it again.
++        IElement[] elements;
++        long versionAtStart;
++        lock (this._elementLock)
++        {
++            elements = this._elements;
++            versionAtStart = this._version;
++        }
++
++        if (elements.Length == 0)
+         {
+-            this._cachedValue = 0;
++            lock (this._elementLock)
++            {
++                if (this._version == versionAtStart)
++                {
++                    this._cachedValue = 0;
++                }
++            }
++
+             return 0;
+         }
+ 
+-        var rawValues = this.Elements.Where(e => e.AggregateType == AggregateType.AddRaw).Sum(e => e.Value);
+-        var multiValues = this.Elements.Where(e => e.AggregateType == AggregateType.Multiplicate).Select(e => e.Value).Concat(Enumerable.Repeat(1.0F, 1)).Aggregate((a, b) => a * b);
+-        var finalValues = this.Elements.Where(e => e.AggregateType == AggregateType.AddFinal).Sum(e => e.Value);
+-        var maxValues = this.Elements.Where(e => e.AggregateType == AggregateType.Maximum).MaxBy(e => e.Value)?.Value ?? 0;
++        var rawValues = elements.Where(e => e.AggregateType == AggregateType.AddRaw).Sum(e => e.Value);
++        var multiValues = elements.Where(e => e.AggregateType == AggregateType.Multiplicate).Select(e => e.Value).Concat(Enumerable.Repeat(1.0F, 1)).Aggregate((a, b) => a * b);
++        var finalValues = elements.Where(e => e.AggregateType == AggregateType.AddFinal).Sum(e => e.Value);
++        var maxValues = elements.Where(e => e.AggregateType == AggregateType.Maximum).MaxBy(e => e.Value)?.Value ?? 0;
+         rawValues += maxValues;
+ 
+-        if (this.Elements.All(e => e.AggregateType == AggregateType.Multiplicate))
++        if (elements.All(e => e.AggregateType == AggregateType.Multiplicate))
+         {
+             rawValues = 1;
+         }
+@@ -84,14 +156,25 @@ public class ComposableAttribute : BaseAttribute, IComposableAttribute
+             newValue = Math.Min(this.Definition.MaximumValue.Value, newValue);
+         }
+ 
+-        this._cachedValue = newValue;
++        lock (this._elementLock)
++        {
++            if (this._version == versionAtStart)
++            {
++                this._cachedValue = newValue;
++            }
++        }
+ 
+-        return this._cachedValue.Value;
++        return newValue;
+     }
+ 
+     private void ElementChanged(object? sender, EventArgs eventArgs)
+     {
+-        this._cachedValue = null;
++        lock (this._elementLock)
++        {
++            this._version++;
++            this._cachedValue = null;
++        }
++
+         this.RaiseValueChanged();
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/src/AttributeSystem/IComposableAttribute.cs b/src/AttributeSystem/IComposableAttribute.cs
+index b9f34005..f0e902db 100644
+--- a/src/AttributeSystem/IComposableAttribute.cs
++++ b/src/AttributeSystem/IComposableAttribute.cs
+@@ -17,6 +17,9 @@ public interface IComposableAttribute : IAttribute
+ {
+     /// <summary>
+     /// Gets the elements, of which this attribute is calculated.
++    /// Implementations may return a detached snapshot rather than a live view, so that the sequence can
++    /// be enumerated safely while elements are concurrently added or removed. Callers must therefore not
++    /// expect to observe later additions or removals through a sequence obtained from a previous access.
+     /// </summary>
+     IEnumerable<IElement> Elements { get; }
+ 
+diff --git a/tests/MUnique.OpenMU.AttributeSystem.Tests/ComposableAttributeTests.cs b/tests/MUnique.OpenMU.AttributeSystem.Tests/ComposableAttributeTests.cs
+index ef1300b6..e27ed3e8 100644
+--- a/tests/MUnique.OpenMU.AttributeSystem.Tests/ComposableAttributeTests.cs
++++ b/tests/MUnique.OpenMU.AttributeSystem.Tests/ComposableAttributeTests.cs
+@@ -195,4 +195,168 @@ public class ComposableAttributeTests
+         this._composableAttribute.RemoveElement(element);
+         Assert.That(eventCalled, Is.True);
+     }
++
++    /// <summary>
++    /// Tests that reading <see cref="ComposableAttribute.Value"/> on one thread while elements are
++    /// added and removed on another thread does not throw. This is a regression test for the race
++    /// condition where a magic effect expiring on a timer thread removed an element while the value was
++    /// being recalculated, exposing a <c>null</c> list slot to the enumeration and throwing a
++    /// <see cref="NullReferenceException"/> (or an <see cref="InvalidOperationException"/>).
++    /// </summary>
++    /// <returns>The task representing the asynchronous test.</returns>
++    [Test]
++    public async Task ConcurrentAddRemoveWhileReadingValueDoesNotThrow()
++    {
++        const int cycles = 20000;
++        foreach (var seed in Enumerable.Range(1, 64))
++        {
++            this._composableAttribute.AddElement(new SimpleElement { Value = seed, AggregateType = AggregateType.AddRaw });
++        }
++
++        Exception? readerError = null;
++
++        var writer = Task.Run(() =>
++        {
++            for (var i = 0; i < cycles; i++)
++            {
++                // Each cycle mutates the element list twice and invalidates the cached value, mirroring
++                // a magic effect that is applied and then expires on a background thread.
++                var element = new SimpleElement { Value = 1, AggregateType = AggregateType.AddRaw };
++                this._composableAttribute.AddElement(element);
++                this._composableAttribute.RemoveElement(element);
++            }
++        });
++
++        var reader = Task.Run(() =>
++        {
++            try
++            {
++                while (!writer.IsCompleted)
++                {
++                    // The concurrent cache invalidation forces a recompute, which enumerates the list.
++                    _ = this._composableAttribute.Value;
++                }
++            }
++            catch (Exception ex)
++            {
++                readerError = ex;
++            }
++        });
++
++        await Task.WhenAll(writer, reader).WaitAsync(TimeSpan.FromSeconds(30)).ConfigureAwait(false);
++
++        // This test asserts crash-freedom under concurrency; it fails with a timeout instead of hanging
++        // should the locking ever deadlock. Cache coherency (that a removal is never latched as a stale
++        // value) is covered deterministically by ConcurrentRemovalDuringReadDoesNotLatchStaleValue.
++        Assert.That(readerError, Is.Null, $"Reading the value concurrently threw: {readerError}");
++    }
++
++    /// <summary>
++    /// Tests that a removal happening while the value is being recalculated is not latched into the cache
++    /// as a stale value. The reentrant element removes another element mid-aggregation - the same lost
++    /// update the version guard in <see cref="ComposableAttribute"/> closes - so without the guard the
++    /// pre-removal value would stick on every subsequent read until an unrelated change invalidated it.
++    /// </summary>
++    [Test]
++    public void ConcurrentRemovalDuringReadDoesNotLatchStaleValue()
++    {
++        var buff = new SimpleElement { Value = 100, AggregateType = AggregateType.AddRaw };
++        this._composableAttribute.AddElement(buff);
++
++        // Removes the buff the first time its value is read during aggregation, deterministically
++        // reproducing "an element is removed on another thread while the value is being computed".
++        this._composableAttribute.AddElement(new ReentrantElement(() => this._composableAttribute.RemoveElement(buff)));
++
++        // Triggers the aggregation during which the buff removes itself.
++        _ = this._composableAttribute.Value;
++
++        // The buff is gone, so the very next read must reflect that (0), not the pre-removal 100.
++        Assert.That(this._composableAttribute.Value, Is.EqualTo(0));
++    }
++
++    /// <summary>
++    /// Tests that recalculating a parent attribute concurrently with mutations of a child attribute it
++    /// depends on neither throws nor deadlocks. The parent's value is computed from an
++    /// <see cref="AttributeRelationshipElement"/> that wraps the child attribute, so a recalculation
++    /// walks into the child while the child's elements are being added and removed on another thread.
++    /// This reproduces the nested variant of the race that surfaced through
++    /// <see cref="AttributeRelationshipElement"/> in the field, and it fails with a timeout instead of
++    /// hanging should the locking ever deadlock.
++    /// </summary>
++    /// <returns>The task representing the asynchronous test.</returns>
++    [Test]
++    public async Task ConcurrentRecalculationOfDependentAttributesDoesNotDeadlock()
++    {
++        const int cycles = 50000;
++        var childDefinition = new AttributeDefinition(new Guid("7C2E4C1B-2C0A-4E7A-9C9E-1B0D3F5A6E77"), "Child attribute", "Child attribute");
++        var child = new ComposableAttribute(childDefinition);
++        child.AddElement(new ConstantElement(10));
++
++        // The parent reads the child attribute as an input element, so recalculating the parent recurses
++        // into the child while the child is mutated concurrently.
++        this._composableAttribute.AddElement(new AttributeRelationshipElement(new IElement[] { child }, new ConstantElement(0), InputOperator.Add));
++
++        Exception? error = null;
++
++        var writer = Task.Run(() =>
++        {
++            for (var i = 0; i < cycles; i++)
++            {
++                var element = new SimpleElement { Value = 1, AggregateType = AggregateType.AddRaw };
++                child.AddElement(element);
++                child.RemoveElement(element);
++            }
++        });
++
++        var reader = Task.Run(() =>
++        {
++            try
++            {
++                while (!writer.IsCompleted)
++                {
++                    _ = this._composableAttribute.Value;
++                }
++            }
++            catch (Exception ex)
++            {
++                error = ex;
++            }
++        });
++
++        await Task.WhenAll(writer, reader).WaitAsync(TimeSpan.FromSeconds(30)).ConfigureAwait(false);
++
++        Assert.That(error, Is.Null, $"Reading the dependent value concurrently threw: {error}");
++    }
++
++    /// <summary>
++    /// An element that runs a one-shot side effect the first time its <see cref="Value"/> is read, used to
++    /// deterministically mutate the composition while it is being aggregated.
++    /// </summary>
++    private sealed class ReentrantElement : IElement
++    {
++        private readonly Action _onFirstRead;
++        private bool _fired;
++
++        public ReentrantElement(Action onFirstRead) => this._onFirstRead = onFirstRead;
++
++#pragma warning disable CS0067 // required by IElement; this test element never raises it
++        public event EventHandler? ValueChanged;
++#pragma warning restore CS0067
++
++        public AggregateType AggregateType => AggregateType.AddRaw;
++
++        public float Value
++        {
++            get
++            {
++                if (!this._fired)
++                {
++                    this._fired = true;
++                    this._onFirstRead();
++                }
++
++                return 0;
++            }
++        }
++    }
+ }
+\ No newline at end of file

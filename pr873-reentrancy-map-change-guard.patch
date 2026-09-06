@@ -1,0 +1,93 @@
+diff --git a/src/GameLogic/Player.cs b/src/GameLogic/Player.cs
+index 789f0bab..f01b155c 100644
+--- a/src/GameLogic/Player.cs
++++ b/src/GameLogic/Player.cs
+@@ -949,6 +949,19 @@ public class Player : AsyncDisposable, IBucketMapObserver, IAttackable, IAttacke
+         this.ThrowNotInitializedProperty(this.SelectedCharacter is null, nameof(this.SelectedCharacter));
+         this.SelectedCharacter.ThrowNotInitializedProperty(this.SelectedCharacter.CurrentMap is null, nameof(this.SelectedCharacter.CurrentMap));
+ 
++        if (this.CurrentMap is not null)
++        {
++            // Guard against a repeated F3 12 (client ready after map change) packet.
++            // A map change usually leaves CurrentMap null until this handler assigns it,
++            // so a non-null value means the handler already ran. The exception is the
++            // IRespawnAfterDeathPlugIn branch of RespawnAtAsync, which assigns CurrentMap
++            // and adds the player itself; a trailing packet is redundant there as well.
++            // Without this guard, a duplicate packet adds the player (and its summon) to
++            // the area of interest a second time, which the bucket does not deduplicate.
++            this.Logger.LogWarning("Ignoring client-ready packet: player {0} is already on map {1}.", this, this.CurrentMap);
++            return;
++        }
++
+         if (this.CurrentMiniGame is { } currentMiniGame)
+         {
+             this.CurrentMap = currentMiniGame.Map;
+diff --git a/tests/MUnique.OpenMU.Tests/ClientReadyAfterMapChangeTests.cs b/tests/MUnique.OpenMU.Tests/ClientReadyAfterMapChangeTests.cs
+new file mode 100644
+index 00000000..53020a61
+--- /dev/null
++++ b/tests/MUnique.OpenMU.Tests/ClientReadyAfterMapChangeTests.cs
+@@ -0,0 +1,63 @@
++// <copyright file="ClientReadyAfterMapChangeTests.cs" company="MUnique">
++// Licensed under the MIT License. See LICENSE file in the project root for full license information.
++// </copyright>
++
++namespace MUnique.OpenMU.Tests;
++
++using System.Linq;
++using System.Threading.Tasks;
++using MUnique.OpenMU.GameLogic;
++using MUnique.OpenMU.Pathfinding;
++using NUnit.Framework;
++
++/// <summary>
++/// Tests for the handling of the client-ready packet which is sent after a map change.
++/// </summary>
++[TestFixture]
++public class ClientReadyAfterMapChangeTests
++{
++    /// <summary>
++    /// Tests that a repeated client-ready packet does not add the player to the
++    /// area of interest a second time. The bucket does not deduplicate its entries,
++    /// and its removal only strips the first occurrence, so a duplicate entry would
++    /// outlive the player on the map.
++    /// </summary>
++    /// <returns>The task.</returns>
++    [Test]
++    public async Task RepeatedClientReadyDoesNotAddPlayerTwiceAsync()
++    {
++        var player = await PlayerTestHelper.CreatePlayerAsync().ConfigureAwait(false);
++        await player.ClientReadyAfterMapChangeAsync().ConfigureAwait(false);
++
++        var map = player.CurrentMap;
++        Assert.That(map, Is.Not.Null);
++        var occurrencesAfterFirst = map!.GetAttackablesInRange(player.Position, 1).Count(o => o == player);
++        Assert.That(occurrencesAfterFirst, Is.EqualTo(1));
++
++        await player.ClientReadyAfterMapChangeAsync().ConfigureAwait(false);
++
++        var occurrencesAfterSecond = map.GetAttackablesInRange(player.Position, 1).Count(o => o == player);
++        Assert.That(occurrencesAfterSecond, Is.EqualTo(1));
++    }
++
++    /// <summary>
++    /// Tests that the player is fully removed from the area of interest after a
++    /// repeated client-ready packet. A duplicate entry would leave a ghost behind,
++    /// because the removal only takes out the first occurrence.
++    /// </summary>
++    /// <returns>The task.</returns>
++    [Test]
++    public async Task PlayerLeavesNoGhostAfterRepeatedClientReadyAsync()
++    {
++        var player = await PlayerTestHelper.CreatePlayerAsync().ConfigureAwait(false);
++        await player.ClientReadyAfterMapChangeAsync().ConfigureAwait(false);
++        await player.ClientReadyAfterMapChangeAsync().ConfigureAwait(false);
++
++        var map = player.CurrentMap;
++        Assert.That(map, Is.Not.Null);
++        var position = player.Position;
++        await map!.RemoveAsync(player).ConfigureAwait(false);
++
++        Assert.That(map.GetAttackablesInRange(position, 1).Any(o => o == player), Is.False);
++    }
++}

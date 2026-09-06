@@ -1,0 +1,319 @@
+diff --git a/src/GameLogic/Bots/BotManager.cs b/src/GameLogic/Bots/BotManager.cs
+index 9929d263..b49dc757 100644
+--- a/src/GameLogic/Bots/BotManager.cs
++++ b/src/GameLogic/Bots/BotManager.cs
+@@ -289,8 +289,10 @@ public sealed class BotManager
+     /// Stops the bot like a regular logout (which saves its progress) and releases its resources.
+     /// A stopped-but-not-disposed player keeps its persistence context - and with it the whole tracked
+     /// account graph - alive; with the presence rotation stopping bots around the clock, that adds up
+-    /// to a leak. Mirrors the teardown of the <see cref="Offline.OfflinePlayerManager"/>; the removal
+-    /// from the game context happens through the disconnect event.
++    /// to a leak. Mirrors the teardown of the <see cref="Offline.OfflinePlayerManager"/>: the removal
++    /// from the game context normally happens through the disconnect event, and when the stop threw
++    /// before it could raise that event, the disposal removes the bot as its own safety net (see
++    /// <see cref="Player.DisposeAsyncCore"/>).
+     /// </summary>
+     private static async ValueTask StopAndDisposeAsync(BotPlayer bot, string key, string reason)
+     {
+@@ -308,6 +310,14 @@ public sealed class BotManager
+         }
+     }
+ 
++    /// <summary>
++    /// Drops a bot which never got as far as playing. It was already added to the game context if its
++    /// initialization failed after <see cref="Player.SetSelectedCharacterAsync"/> was reached, and it is
++    /// never disconnected on this path - the disposal takes it out of the player list (see
++    /// <see cref="Player.DisposeAsyncCore"/>).
++    /// </summary>
++    /// <param name="key">The key of the bot.</param>
++    /// <param name="bot">The bot to drop.</param>
+     private async ValueTask RemoveAndDisposeAsync(string key, BotPlayer bot)
+     {
+         this._bots.TryRemove(key, out _);
+diff --git a/src/GameLogic/GameContext.cs b/src/GameLogic/GameContext.cs
+index 6bb434b6..9bb69f47 100644
+--- a/src/GameLogic/GameContext.cs
++++ b/src/GameLogic/GameContext.cs
+@@ -363,7 +363,21 @@ public class GameContext : AsyncDisposable, IGameContext
+             this.PlayersByCharacterName.TryRemove(player.SelectedCharacter.Name, out _);
+         }
+ 
+-        player.CurrentMap?.RemoveAsync(player);
++        if (player.CurrentMap is { } currentMap)
++        {
++            // Awaited and guarded: discarding the ValueTask left the removal running in the
++            // background - racing the player's own disposal on the dispose-without-disconnect
++            // paths - with any exception lost, while this method has to stay exception-free for
++            // the teardown paths which call it right before the dispose.
++            try
++            {
++                await currentMap.RemoveAsync(player).ConfigureAwait(false);
++            }
++            catch (Exception ex)
++            {
++                player.Logger.LogError(ex, "Error while removing player {Player} from its map.", player);
++            }
++        }
+ 
+         player.PlayerDisconnected -= this.RemovePlayerAsync;
+         player.PlayerEnteredWorld -= this.PlayerEnteredWorldAsync;
+diff --git a/src/GameLogic/Offline/OfflinePlayerManager.cs b/src/GameLogic/Offline/OfflinePlayerManager.cs
+index bffd10db..a007427b 100644
+--- a/src/GameLogic/Offline/OfflinePlayerManager.cs
++++ b/src/GameLogic/Offline/OfflinePlayerManager.cs
+@@ -186,7 +186,10 @@ public sealed class OfflinePlayerManager
+ 
+     /// <summary>
+     /// Removes the sentinel entry from the active players dictionary and disposes the ghost.
+-    /// Used when startup fails before the ghost is fully initialized.
++    /// Used when startup fails before the ghost is fully initialized. The ghost is already part of the
++    /// game context when the failure happened after <see cref="Player.SetSelectedCharacterAsync"/> was
++    /// reached, and it is never disconnected on this path - the disposal takes it out of the player
++    /// list (see <see cref="Player.DisposeAsyncCore"/>).
+     /// </summary>
+     /// <param name="loginName">The account login name.</param>
+     /// <param name="sentinel">The ghost player to dispose.</param>
+diff --git a/src/GameLogic/Player.cs b/src/GameLogic/Player.cs
+index 0e6f55ba..b44b8da8 100644
+--- a/src/GameLogic/Player.cs
++++ b/src/GameLogic/Player.cs
+@@ -941,11 +941,56 @@ public class Player : AsyncDisposable, IBucketMapObserver, IAttackable, IAttacke
+         {
+             try
+             {
+-                await this.InternalDisconnectAsync().ConfigureAwait(false);
++                try
++                {
++                    await this.InternalDisconnectAsync().ConfigureAwait(false);
++                }
++                catch (Exception ex)
++                {
++                    // The subscribers below are what take the player out of the game context's player
++                    // list - and, for a remote player, dispose it. A teardown which throws half way
++                    // must not skip them: the state machine has already left the state this method
++                    // needs to advance from, so no later call can raise the event again. The player
++                    // would stay in the list, counting towards the server's maximum player count and
++                    // keeping its whole object graph alive, until the process restarts.
++                    this.Logger.LogError(ex, "Error while disconnecting player {Player}; continuing the teardown.", this);
++
++                    // Saving is the LAST step of the regular teardown (see RemoveFromGameAsync), so
++                    // the throw above may well have skipped it. Without a save, continuing would turn
++                    // the failure into silent data loss: the caller sees a successful logout, disposes
++                    // this instance, and the next session loads the character from the database -
++                    // rolled back to its last periodic save.
++                    try
++                    {
++                        await this.SaveProgressAsync().ConfigureAwait(false);
++                    }
++                    catch (Exception saveException)
++                    {
++                        this.Logger.LogError(saveException, "Couldn't save the progress of player {Player} after its teardown failed.", this);
++                    }
++                }
++
+                 if (this.PlayerDisconnected is { } disconnectedEventHandler)
+                 {
+                     this.PlayerDisconnected = null;
+-                    await disconnectedEventHandler(this).ConfigureAwait(false);
++
++                    // One by one instead of awaiting the multicast delegate: invoking a multicast
++                    // ValueTask delegate awaits only the LAST subscriber's task, so the earlier ones
++                    // (the removal from the game context's player list) would run unobserved and
++                    // possibly still be in flight while the last one (which disposes a remote player)
++                    // executes. Isolating each subscriber also keeps one failing handler from skipping
++                    // the others - the handler list is already dropped, so nothing could re-run them.
++                    foreach (var subscriber in disconnectedEventHandler.GetInvocationList())
++                    {
++                        try
++                        {
++                            await ((AsyncEventHandler<Player>)subscriber)(this).ConfigureAwait(false);
++                        }
++                        catch (Exception ex)
++                        {
++                            this.Logger.LogError(ex, "A PlayerDisconnected subscriber of player {Player} failed.", this);
++                        }
++                    }
+                 }
+             }
+             finally
+@@ -1259,6 +1304,23 @@ public class Player : AsyncDisposable, IBucketMapObserver, IAttackable, IAttacke
+     /// <inheritdoc />
+     protected override async ValueTask DisposeAsyncCore()
+     {
++        // A disposed player must never stay reachable from the game context: it would keep counting
++        // towards the server's maximum player count (which turns real clients away) and keep its whole
++        // object graph alive. The regular teardown removes it through the PlayerDisconnected event, but
++        // a player which is disposed WITHOUT having been disconnected - a login or spawn which failed
++        // after the player was already added to the game - never raises that event, and the fields
++        // below drop the handler which could still do it. Removing here is the last line of defense,
++        // and it is idempotent, so it does nothing on the regular path.
++        try
++        {
++            await this.GameContext.RemovePlayerAsync(this).ConfigureAwait(false);
++        }
++        catch (Exception ex)
++        {
++            // Must not abort the rest of the disposal - the remaining resources have to be released.
++            this.Logger.LogError(ex, "Error while removing player {Player} from the game context during disposal.", this);
++        }
++
+         await this._muHelperLazy.DisposeIfCreatedAsync().ConfigureAwait(false);
+ 
+         this._petCommandManager?.Dispose();
+diff --git a/src/GameServer/RemoteView/RemotePlayer.cs b/src/GameServer/RemoteView/RemotePlayer.cs
+index 7d46e277..5fefa26e 100644
+--- a/src/GameServer/RemoteView/RemotePlayer.cs
++++ b/src/GameServer/RemoteView/RemotePlayer.cs
+@@ -116,6 +116,41 @@ public class RemotePlayer : Player, IClientVersionProvider, IHasIpAddress
+         }
+     }
+ 
++    /// <inheritdoc/>
++    protected override async ValueTask DisposeAsyncCore()
++    {
++        // The teardown above only reaches the connection when the base teardown succeeded - a throw
++        // out of it (which DisconnectAsync catches and continues from) would otherwise leave the
++        // player disposed while its socket stays open with the packet handler still subscribed,
++        // feeding client packets into the disposed player until the client gives up. And once the
++        // player state advanced to Finished, the connection's own Disconnected -> DisconnectAsync
++        // callback can no longer run the teardown either - so the disposal is the last place which
++        // can still close it.
++        if (this.Connection is { } connection)
++        {
++            this.Connection = null;
++            connection.PacketReceived -= this.PacketReceivedAsync;
++            connection.Disconnected -= this.DisconnectAsync;
++            try
++            {
++                if (connection.Connected)
++                {
++                    await connection.DisconnectAsync().ConfigureAwait(false);
++                }
++            }
++            catch (Exception ex)
++            {
++                this.Logger.LogError(ex, "Error while disconnecting the connection of player {Player} during disposal.", this);
++            }
++            finally
++            {
++                connection.Dispose();
++            }
++        }
++
++        await base.DisposeAsyncCore().ConfigureAwait(false);
++    }
++
+     /// <summary>
+     /// Is getting called when a packet got received from the connection of the player.
+     /// </summary>
+diff --git a/tests/MUnique.OpenMU.Tests/PlayerRemovalOnDisposeTests.cs b/tests/MUnique.OpenMU.Tests/PlayerRemovalOnDisposeTests.cs
+new file mode 100644
+index 00000000..52a7e260
+--- /dev/null
++++ b/tests/MUnique.OpenMU.Tests/PlayerRemovalOnDisposeTests.cs
+@@ -0,0 +1,105 @@
++// <copyright file="PlayerRemovalOnDisposeTests.cs" company="MUnique">
++// Licensed under the MIT License. See LICENSE file in the project root for full license information.
++// </copyright>
++
++namespace MUnique.OpenMU.Tests;
++
++using MUnique.OpenMU.GameLogic;
++using MUnique.OpenMU.GameLogic.Offline;
++
++/// <summary>
++/// Tests that a player never stays in the game context's player list after its teardown.
++/// <para>
++/// A player which is counted but no longer playing occupies a slot of the server's maximum player
++/// count forever, which turns real clients away once enough of them piled up - and keeps its whole
++/// object graph alive. Both paths below used to leave such a player behind.
++/// </para>
++/// </summary>
++[TestFixture]
++public class PlayerRemovalOnDisposeTests
++{
++    /// <summary>
++    /// Tests that a player which is disposed WITHOUT having been disconnected is removed from the
++    /// game context. That is what happens when a login or a bot spawn fails after the player was
++    /// already added to the game: the failure path disposes it, and no disconnect event is ever
++    /// raised which could take it out of the player list.
++    /// </summary>
++    [Test]
++    public async ValueTask DisposeWithoutDisconnectRemovesPlayerFromGameContextAsync()
++    {
++        var player = await PlayerTestHelper.CreatePlayerAsync().ConfigureAwait(false);
++        var gameContext = player.GameContext;
++        await gameContext.AddPlayerAsync(player).ConfigureAwait(false);
++        Assert.That(gameContext.PlayerCount, Is.EqualTo(1));
++
++        await player.DisposeAsync().ConfigureAwait(false);
++
++        Assert.That(gameContext.PlayerCount, Is.EqualTo(0));
++    }
++
++    /// <summary>
++    /// Tests that a player whose teardown throws is still removed from the game context. The state
++    /// machine has already advanced by then, so a later <see cref="Player.DisconnectAsync"/> is a
++    /// no-op - if the removal is skipped here, nothing can ever remove the player again.
++    /// </summary>
++    [Test]
++    public async ValueTask FailingDisconnectStillRemovesPlayerFromGameContextAsync()
++    {
++        var template = await PlayerTestHelper.CreatePlayerAsync().ConfigureAwait(false);
++        var gameContext = template.GameContext;
++        var player = new ThrowingOfflinePlayer(gameContext) { Account = template.Account };
++        await player.PlayerState.TryAdvanceToAsync(PlayerState.LoginScreen).ConfigureAwait(false);
++        await player.PlayerState.TryAdvanceToAsync(PlayerState.Authenticated).ConfigureAwait(false);
++        await player.PlayerState.TryAdvanceToAsync(PlayerState.CharacterSelection).ConfigureAwait(false);
++        await player.SetSelectedCharacterAsync(template.SelectedCharacter!).ConfigureAwait(false);
++
++        await gameContext.AddPlayerAsync(player).ConfigureAwait(false);
++        Assert.That(gameContext.PlayerCount, Is.EqualTo(1));
++
++        await player.DisconnectAsync().ConfigureAwait(false);
++
++        Assert.That(gameContext.PlayerCount, Is.EqualTo(0));
++    }
++
++    /// <summary>
++    /// Tests that a <see cref="Player.PlayerDisconnected"/> subscriber which throws does not keep the
++    /// later subscribers from running. The subscribers are what remove the player from the game and,
++    /// for a remote player, dispose it - and the handler list is dropped before the invocation, so a
++    /// skipped subscriber could never be re-run.
++    /// </summary>
++    [Test]
++    public async ValueTask FailingDisconnectSubscriberDoesNotSkipLaterSubscribersAsync()
++    {
++        var player = await PlayerTestHelper.CreatePlayerAsync().ConfigureAwait(false);
++        var gameContext = player.GameContext;
++        await gameContext.AddPlayerAsync(player).ConfigureAwait(false);
++
++        var laterSubscriberRan = false;
++        player.PlayerDisconnected += _ => throw new InvalidOperationException("First subscriber fails.");
++        player.PlayerDisconnected += _ =>
++        {
++            laterSubscriberRan = true;
++            return ValueTask.CompletedTask;
++        };
++
++        await player.DisconnectAsync().ConfigureAwait(false);
++
++        Assert.That(laterSubscriberRan, Is.True);
++        Assert.That(gameContext.PlayerCount, Is.EqualTo(0));
++    }
++
++    /// <summary>
++    /// An offline player whose teardown fails, like a bot which lost the race on one of the engine's
++    /// non-thread-safe lists during its logout.
++    /// </summary>
++    private sealed class ThrowingOfflinePlayer : OfflinePlayer
++    {
++        public ThrowingOfflinePlayer(IGameContext gameContext)
++            : base(gameContext)
++        {
++        }
++
++        protected override ValueTask InternalDisconnectAsync()
++            => throw new InvalidOperationException("Teardown failed.");
++    }
++}

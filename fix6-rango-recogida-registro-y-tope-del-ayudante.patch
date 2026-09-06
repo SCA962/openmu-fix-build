@@ -1,0 +1,66 @@
+diff --git a/src/GameLogic/Offline/ItemPickupHandler.cs b/src/GameLogic/Offline/ItemPickupHandler.cs
+index d16cd5b..f9bde3e 100644
+--- a/src/GameLogic/Offline/ItemPickupHandler.cs
++++ b/src/GameLogic/Offline/ItemPickupHandler.cs
+@@ -1,4 +1,4 @@
+-// <copyright file="ItemPickupHandler.cs" company="MUnique">
++﻿// <copyright file="ItemPickupHandler.cs" company="MUnique">
+ // Licensed under the MIT License. See LICENSE file in the project root for full license information.
+ // </copyright>
+ 
+@@ -61,7 +61,13 @@ public sealed class ItemPickupHandler
+             return;
+         }
+ 
+-        byte range = (byte)Math.Max(this._config.ObtainRange, MinPickupRange);
++        // ObtainRange is a 4 bit field, so the player can configure up to 15 - but the pick-up
++        // itself goes through the very same PickupItemAction and is refused beyond
++        // MaximumPickupDistance. Searching further only produces calls which are guaranteed to
++        // fail, once per tick per drop, and each of those now writes a log line.
++        byte range = (byte)Math.Min(
++            Math.Max(this._config.ObtainRange, MinPickupRange),
++            PickupItemAction.MaximumPickupDistance);
+         var drops = map.GetDropsInRange(this._player.Position, range);
+ 
+         foreach (var drop in drops)
+diff --git a/src/GameLogic/PlayerActions/Items/PickupItemAction.cs b/src/GameLogic/PlayerActions/Items/PickupItemAction.cs
+index 14db5fe..fb8226b 100644
+--- a/src/GameLogic/PlayerActions/Items/PickupItemAction.cs
++++ b/src/GameLogic/PlayerActions/Items/PickupItemAction.cs
+@@ -15,6 +15,17 @@ using MUnique.OpenMU.Interfaces;
+ /// </summary>
+ public class PickupItemAction
+ {
++    /// <summary>
++    /// The maximum distance between the player and a dropped item or money for the pick-up to be
++    /// accepted. The client is only told "it failed", with the same generic reason used for a full
++    /// inventory or an unknown drop, so a limit which is too tight is indistinguishable from
++    /// "the pick-up does nothing" whenever the position the server holds lags behind the one the
++    /// client shows. Items land at most 2 steps from the monster that dropped them, and the game
++    /// already lets the helper look for drops up to 15 steps away, so 5 is generous for the normal
++    /// case and still short for any abuse.
++    /// </summary>
++    internal const int MaximumPickupDistance = 5;
++
+     /// <summary>
+     /// Pickups the item.
+     /// </summary>
+@@ -76,8 +87,17 @@ public class PickupItemAction
+         }
+ 
+         var dist = (int)player.GetDistanceTo(droppedLocateable);
+-        if (dist > 3)
++        if (dist > MaximumPickupDistance)
+         {
++            // Without this line the rejection leaves no trace at all: the client gets a generic
++            // failure and the log says nothing, so "I click and nothing happens" cannot be told
++            // apart from a full inventory or a drop that is already gone. It is also the only way
++            // to find out whether 5 is actually enough, which raising the limit alone does not answer.
++            player.Logger.LogInformation(
++                "PICKUP rejected by distance: player [{Player}] is {Distance} steps away from the drop, the limit is {Limit}.",
++                player.Name,
++                dist,
++                MaximumPickupDistance);
+             return false;
+         }
+ 

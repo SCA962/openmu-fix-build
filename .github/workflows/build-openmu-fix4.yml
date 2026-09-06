@@ -1,0 +1,151 @@
+name: Construir munique/openmu 0.9.10-fix4 (compila, PRUEBA, y solo entonces empaqueta)
+
+# Diferencia con el workflow anterior, y es la razon de existir de este fichero:
+# el anterior solo hacia "docker build", y ese Dockerfile compila UNICAMENTE el proyecto Startup.
+# Nunca ejecuta los tests, y ni siquiera compila los proyectos de tests/. Con el anterior,
+# "la compilacion esta en verde" NO significaba "los tests pasan": significaba solo que el
+# servidor enlaza. Aqui los tests corren de verdad, antes de empaquetar nada.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+env:
+  BASE_COMMIT: d4ca915c442a56e267e3f01638822f367fa81082
+
+jobs:
+  build:
+    name: OpenMU d4ca915c + desplegado + fix3 + registros + PR873 + PR914 + PR887 + misiones + recogida
+    runs-on: ubuntu-latest
+    steps:
+      - name: Receta y parches (este repositorio)
+        uses: actions/checkout@v4
+        with:
+          path: receta
+
+      - name: Codigo de OpenMU en el commit exacto de la imagen 0.9.10
+        uses: actions/checkout@v4
+        with:
+          repository: MUnique/OpenMU
+          ref: d4ca915c442a56e267e3f01638822f367fa81082
+          path: OpenMU
+
+      - name: Comprobar la base
+        working-directory: OpenMU
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$BASE_COMMIT" || { echo "commit base inesperado" >&2; exit 1; }
+          grep -q 'AssemblyVersion("0.9.10.0")' src/SharedAssemblyInfo.cs || { echo "el commit base no dice version 0.9.10" >&2; exit 1; }
+          # El arbol tiene que estar COMPLETO. Un checkout parcial hace que un parche "aplique limpio"
+          # solo porque el fichero que tocaria no esta, y eso ya nos dio un veredicto falso una vez.
+          test "$(ls tests | wc -l)" -ge 13 || { echo "el arbol de tests esta incompleto: $(ls tests | wc -l) entradas" >&2; exit 1; }
+          test -d tests/MUnique.OpenMU.AttributeSystem.Tests || { echo "falta AttributeSystem.Tests" >&2; exit 1; }
+
+      - name: Aplicar los parches EN ORDEN, cada uno comprobado antes
+        working-directory: OpenMU
+        run: |
+          set -euo pipefail
+          for p in \
+            openmu-0.9.10-fix-guardado.patch \
+            openmu-0.9.10-fix3-guardado.patch \
+            openmu-0.9.10-fix4-registros.patch \
+            pr873-reentrancy-map-change-guard.patch \
+            pr914-player-slot-leak.patch \
+            pr887-composableattribute-race.patch \
+            fix5-quest-collection-modified.patch \
+            fix6-rango-recogida-registro-y-tope-del-ayudante.patch ; do
+              echo "----- $p"
+              test -f "../receta/$p" || { echo "falta el parche $p en el repositorio" >&2; exit 1; }
+              git apply --check "../receta/$p"
+              git apply "../receta/$p"
+          done
+          git status --short
+
+      - name: Verificar que el arbol quedo como el ensayo en seco
+        working-directory: OpenMU
+        run: |
+          set -euo pipefail
+          m=$(git status --short | grep -c '^ M ' || true)
+          n=$(git status --short | grep -c '^?? ' || true)
+          echo "modificados=$m nuevos=$n"
+          [ "$m" = "20" ] && [ "$n" = "3" ] || { echo "esperaba 20 modificados y 3 nuevos, hay $m y $n" >&2; exit 1; }
+          # Marcadores de contenido: uno por pieza, para que un parche vacio o truncado no pase.
+          grep -q 'RunPersistenceExclusiveAsync'            src/GameLogic/Player.cs                                   || { echo "falta el candado por jugador (PR854)" >&2; exit 1; }
+          grep -q 'EXIT-FLOW start'                          src/GameLogic/Player.cs                                   || { echo "falta el registro del flujo de salida" >&2; exit 1; }
+          grep -q 'ConsecutiveSaveFailures'                  src/GameLogic/Player.cs                                   || { echo "falta el contador de fallos (B3)" >&2; exit 1; }
+          grep -q 'MaximumConsecutiveSaveFailures'           src/GameLogic/PlugIns/PeriodicSaveProgressPlugIn.cs       || { echo "falta B3 en el guardado periodico" >&2; exit 1; }
+          grep -q 'TryReconcileStaleEntriesAsync'            src/Persistence/EntityFramework/EntityFrameworkContextBase.cs || { echo "falta la reconciliacion (fix3 b)" >&2; exit 1; }
+          grep -q 'CountTrackedEntriesSafely'                src/Persistence/EntityFramework/EntityFrameworkContextBase.cs || { echo "falta el contador de entidades seguidas" >&2; exit 1; }
+          grep -q 'LOGIN rejected'                           src/GameLogic/PlayerActions/LoginAction.cs                || { echo "faltan los registros de rechazo de login" >&2; exit 1; }
+          test "$(grep -c 'LOGIN rejected' src/GameLogic/PlayerActions/LoginAction.cs)" = "3"                          || { echo "esperaba los TRES sitios de rechazo de login" >&2; exit 1; }
+          grep -q 'LOGOUT requested'                         src/GameLogic/PlayerActions/LogoutAction.cs               || { echo "falta el registro del tipo de salida" >&2; exit 1; }
+          grep -q 'TRADE committing'                         src/GameLogic/PlayerActions/Trade/TradeButtonAction.cs    || { echo "falta el registro del comercio" >&2; exit 1; }
+          grep -q 'RequirementStates.ToList()'                src/GameLogic/PlayerActions/Quests/QuestExtensions.cs     || { echo "falta el arreglo de las misiones" >&2; exit 1; }
+          grep -q 'MaximumPickupDistance = 5'                 src/GameLogic/PlayerActions/Items/PickupItemAction.cs     || { echo "falta el rango de recogida" >&2; exit 1; }
+          grep -q 'PICKUP rejected by distance'               src/GameLogic/PlayerActions/Items/PickupItemAction.cs     || { echo "falta el registro del rechazo por distancia" >&2; exit 1; }
+          grep -q 'PickupItemAction.MaximumPickupDistance'    src/GameLogic/Offline/ItemPickupHandler.cs                || { echo "falta el tope de busqueda del ayudante" >&2; exit 1; }
+          echo "todos los marcadores presentes"
+
+      - name: Instalar el SDK de .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Compilar la solucion COMPLETA (incluye los proyectos de tests)
+        working-directory: OpenMU/src
+        run: dotnet build MUnique.OpenMU.sln --configuration Release -p:ci=true
+
+      - name: EJECUTAR LOS TESTS (esto es lo que convierte "escrito" en "probado")
+        working-directory: OpenMU/src
+        run: dotnet test MUnique.OpenMU.sln --configuration Release --no-build -p:ci=true --logger "trx;LogFileName=resultado.trx" --results-directory ../resultados
+
+      - name: Guardar el resultado de los tests pase lo que pase
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resultados-de-tests
+          path: OpenMU/resultados
+          if-no-files-found: warn
+
+      - name: Construir la imagen (mismo comando que el paquete)
+        working-directory: OpenMU/src
+        run: docker build -f Startup/Dockerfile -t munique/openmu:0.9.10-fix4 .
+
+      - name: Verificar la imagen
+        run: |
+          set -euo pipefail
+          docker image inspect munique/openmu:0.9.10-fix4 --format 'id {{.Id}} creada {{.Created}} tamano {{.Size}} bytes arquitectura {{.Architecture}}'
+          [ "$(docker image inspect munique/openmu:0.9.10-fix4 --format '{{.Architecture}}')" = "amd64" ] || { echo "arquitectura inesperada" >&2; exit 1; }
+
+      - name: Empaquetar (docker save)
+        run: |
+          set -euo pipefail
+          docker save munique/openmu:0.9.10-fix4 | gzip -6 > openmu-0.9.10-fix4.tar.gz
+          sha256sum openmu-0.9.10-fix4.tar.gz | tee sha256.txt
+          ls -l openmu-0.9.10-fix4.tar.gz
+
+      - name: Publicar release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="openmu-0.9.10-fix4-r${{ github.run_number }}"
+          {
+            echo "munique/openmu:0.9.10-fix4 = OpenMU en el commit $BASE_COMMIT (la misma base que la imagen oficial 0.9.10)"
+            echo "mas, en este orden: parche del guardado (PR 854, ya desplegado hoy), fix3 (candado en la salida,"
+            echo "reconciliacion y B3), registros (salida, login, comercio), PR 873, PR 914 y PR 887."
+            echo
+            echo "Los tests de la solucion se ejecutaron y pasaron ANTES de construir esta imagen."
+            echo
+            echo "Cargar en el servidor: docker load -i openmu-0.9.10-fix4.tar.gz"
+            echo
+            echo "sha256:"
+            echo '```'
+            cat sha256.txt
+            echo '```'
+          } > notas.md
+          gh release create "$TAG" --repo "${{ github.repository }}" --title "munique/openmu:0.9.10-fix4 ($TAG)" --notes-file notas.md openmu-0.9.10-fix4.tar.gz sha256.txt
