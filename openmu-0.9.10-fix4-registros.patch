@@ -120,7 +120,7 @@ index 472cf518..66597593 100644
          // first make sure that all items which could be transferred are already present in the database
 +        // Note for the log reader: this save goes through Player.SaveProgressAsync, so a trade opened
 +        // on a poisoned session counts towards the consecutive-failure counter as well.
-+        trader.Logger.LogInformation(
++        (trader as Player)?.Logger.LogInformation(
 +            "TRADE opened for [{Trader}] with partner [{Partner}].",
 +            trader.Name,
 +            trader.TradingPartner?.Name ?? "(none)");
