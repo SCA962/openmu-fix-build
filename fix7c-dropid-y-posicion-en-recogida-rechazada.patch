@@ -1,0 +1,35 @@
+diff --git a/src/GameLogic/PlayerActions/Items/PickupItemAction.cs b/src/GameLogic/PlayerActions/Items/PickupItemAction.cs
+index fb8226b..9a177c5 100644
+--- a/src/GameLogic/PlayerActions/Items/PickupItemAction.cs
++++ b/src/GameLogic/PlayerActions/Items/PickupItemAction.cs
+@@ -68,6 +68,16 @@ public class PickupItemAction
+                 }
+ 
+             default:
++                // The blind path: the client asks for a drop the server does not have (anymore). Without this
++                // line it is indistinguishable from "too far" and "no space", because all three answer with
++                // the same generic failure. Drop ids are recycled quickly, so the id alone is not enough:
++                // the player's position tells whether the client was looking at a stale picture of the floor.
++                player.Logger.LogInformation(
++                    "PICKUP rejected, drop {DropId} does not exist on map [{Map}]: player [{Player}] stands at {Position}.",
++                    dropId,
++                    player.CurrentMap?.Definition.Name ?? "(none)",
++                    player.Name,
++                    player.Position);
+                 await player.InvokeViewPlugInAsync<IItemPickUpFailedPlugIn>(p => p.ItemPickUpFailedAsync(ItemPickFailReason.General)).ConfigureAwait(false);
+                 break;
+         }
+@@ -94,9 +104,12 @@ public class PickupItemAction
+             // apart from a full inventory or a drop that is already gone. It is also the only way
+             // to find out whether 5 is actually enough, which raising the limit alone does not answer.
+             player.Logger.LogInformation(
+-                "PICKUP rejected by distance: player [{Player}] is {Distance} steps away from the drop, the limit is {Limit}.",
++                "PICKUP rejected by distance: player [{Player}] at {PlayerPosition} is {Distance} steps away from drop {DropId} at {DropPosition}, the limit is {Limit}.",
+                 player.Name,
++                player.Position,
+                 dist,
++                droppedLocateable.Id,
++                droppedLocateable.Position,
+                 MaximumPickupDistance);
+             return false;
+         }

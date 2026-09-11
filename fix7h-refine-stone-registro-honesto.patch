@@ -1,0 +1,22 @@
+diff --git a/src/GameLogic/PlayerActions/Craftings/RefineStoneCrafting.cs b/src/GameLogic/PlayerActions/Craftings/RefineStoneCrafting.cs
+index 7f870e2..7dfb586 100644
+--- a/src/GameLogic/PlayerActions/Craftings/RefineStoneCrafting.cs
++++ b/src/GameLogic/PlayerActions/Craftings/RefineStoneCrafting.cs
+@@ -154,6 +154,17 @@ public class RefineStoneCrafting : SimpleItemCraftingHandler
+             result.AddRange(await this.CreateRefineStonesAsync(lowerRefineStoneItems, 20, 43, player).ConfigureAwait(false));
+         }
+ 
++        // The recipe is configured at 100 %, so the base handler always logs "Crafting succeeded" and has
++        // already consumed the items by the time this runs; the real chance is rolled here, per item
++        // (50 % for a higher stone, 20 % for a lower one). Without this line the log shows a success
++        // followed by "failed to mix" and nobody can tell that this is the designed behaviour.
++        player.Logger.LogInformation(
++            "REFINE STONE for [{Player}]: {HigherIn} item(s) at 50 % and {LowerIn} item(s) at 20 % went in, {StonesOut} stone(s) came out. The items are consumed either way; zero stones is reported to the player as a failed mix.",
++            player.Name,
++            higherRefineStoneItems,
++            lowerRefineStoneItems,
++            result.Count);
++
+         return result;
+     }
+ 

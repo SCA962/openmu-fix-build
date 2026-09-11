@@ -1,0 +1,42 @@
+diff --git a/src/GameLogic/NPC/AttackableNpcBase.cs b/src/GameLogic/NPC/AttackableNpcBase.cs
+index 1873995..8a41fda 100644
+--- a/src/GameLogic/NPC/AttackableNpcBase.cs
++++ b/src/GameLogic/NPC/AttackableNpcBase.cs
+@@ -22,6 +22,13 @@ public abstract class AttackableNpcBase : NonPlayerCharacter, IAttackable
+     private const byte MaximumDropDistance = 2;
+ 
+     private readonly IEventStateProvider? _eventStateProvider;
++    /// <summary>
++    /// A monster whose respawn takes at least this long is treated as a boss for the log. The value is
++    /// data driven on purpose: in this configuration the twelve bosses (the Kundun illusions, Erohim,
++    /// Selupan, Hydra, Zaikan, Head Mounter) respawn after 3 or 6 hours, the next longest is 10 minutes.
++    /// </summary>
++    private static readonly TimeSpan BossRespawnDelayThreshold = TimeSpan.FromMinutes(30);
++
+     private readonly IDropGenerator _dropGenerator;
+     private readonly PlugInManager _plugInManager;
+     private readonly List<IDisposable> _registrations = new();
+@@ -307,6 +314,23 @@ public abstract class AttackableNpcBase : NonPlayerCharacter, IAttackable
+         var player = this.GetHitNotificationTarget(attacker);
+         if (player is { })
+         {
++            if (this.Definition.RespawnDelay >= BossRespawnDelayThreshold)
++            {
++                // Without this line a boss which was killed is indistinguishable from one which never
++                // spawned: the drops are logged only when picked up, and by whoever picks them up.
++                player.Logger.LogInformation(
++                    "BOSS killed: [{Monster}] (number {Number}, level {Level}) on map [{Map}] at {Position}, killed by [{Killer}] (account [{Account}], party of {PartySize}); respawns in {Respawn}.",
++                    this.Definition.Designation,
++                    this.Definition.Number,
++                    (int)this.Attributes[Stats.Level],
++                    this.CurrentMap.Definition.Name,
++                    this.Position,
++                    player.Name,
++                    player.Account?.LoginName ?? "(none)",
++                    player.Party?.PartyList.Count ?? 1,
++                    this.Definition.RespawnDelay);
++            }
++
+             var experienceShares = player.Party is { } party
+                 ? await party.DistributeExperienceAfterKillAsync(this, player).ConfigureAwait(false)
+                 : [new ExperienceShare(player, await player.AddExpAfterKillAsync(this).ConfigureAwait(false))];

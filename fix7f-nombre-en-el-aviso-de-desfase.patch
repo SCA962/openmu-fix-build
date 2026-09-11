@@ -1,0 +1,15 @@
+diff --git a/src/GameLogic/Player.cs b/src/GameLogic/Player.cs
+index 2ce8987..59dfea4 100644
+--- a/src/GameLogic/Player.cs
++++ b/src/GameLogic/Player.cs
+@@ -1398,7 +1398,9 @@ public class Player : AsyncDisposable, IBucketMapObserver, IAttackable, IAttacke
+         var startOffset = startPoint.EuclideanDistanceTo(currentPosition);
+         if (startOffset > maxAllowedWalkStartOffset)
+         {
+-            this.Logger.LogWarning("WalkToAsync: Player requested to walk from {0}, but it's currently at {1} (offset {2} > {3}). Resynchronizing client.", startPoint, currentPosition, startOffset, maxAllowedWalkStartOffset);
++            // The name is what makes this line usable: without it, two players moving in the same second
++            // cannot be told apart, and the desync cannot be correlated with anything else in the log.
++            this.Logger.LogWarning("WalkToAsync: Player [{Player}] (account [{Account}]) on map [{Map}] requested to walk from {0}, but it's currently at {1} (offset {2} > {3}). Resynchronizing client.", this.Name, this.Account?.LoginName ?? "(none)", this.CurrentMap?.Definition.Name ?? "(none)", startPoint, currentPosition, startOffset, maxAllowedWalkStartOffset);
+             if (speedCheck is { })
+             {
+                 await speedCheck.ResetMovementStateAsync(this).ConfigureAwait(false);

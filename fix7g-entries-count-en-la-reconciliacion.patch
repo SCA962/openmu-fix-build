@@ -1,0 +1,28 @@
+diff --git a/src/Persistence/EntityFramework/EntityFrameworkContextBase.cs b/src/Persistence/EntityFramework/EntityFrameworkContextBase.cs
+index 08c6eae..b64345f 100644
+--- a/src/Persistence/EntityFramework/EntityFrameworkContextBase.cs
++++ b/src/Persistence/EntityFramework/EntityFrameworkContextBase.cs
+@@ -159,20 +159,20 @@ internal class EntityFrameworkContextBase : IContext
+             if (databaseValues is not null)
+             {
+                 entry.OriginalValues.SetValues(databaseValues);
+-                this._logger.LogWarning("Save conflict resolved: {Entry} changed in the database; retrying against the current row.", DescribeEntry(entry));
++                this._logger.LogWarning("Save conflict resolved: {Entry} changed in the database; retrying against the current row. Entries in this conflict: {ConflictEntries}.", DescribeEntry(entry), exception.Entries.Count);
+                 reconciled = true;
+                 continue;
+             }
+ 
+             if (entry.State == EntityState.Deleted)
+             {
+-                this._logger.LogWarning("Save conflict resolved: {Entry} is already gone from the database; dropping the pending delete.", DescribeEntry(entry));
++                this._logger.LogWarning("Save conflict resolved: {Entry} is already gone from the database; dropping the pending delete. Entries in this conflict: {ConflictEntries}.", DescribeEntry(entry), exception.Entries.Count);
+                 entry.State = EntityState.Detached;
+                 reconciled = true;
+                 continue;
+             }
+ 
+-            this._logger.LogError("Save conflict NOT resolvable: {Entry} no longer exists in the database. Leaving it attached on purpose - detaching it could resurrect a deleted row as a duplicate later on. Tracked entries in this context: {TrackedEntries}.", DescribeEntry(entry), this.CountTrackedEntriesSafely());
++            this._logger.LogError("Save conflict NOT resolvable: {Entry} no longer exists in the database. Leaving it attached on purpose - detaching it could resurrect a deleted row as a duplicate later on. Entries in this conflict: {ConflictEntries}, tracked entries in this context: {TrackedEntries}.", DescribeEntry(entry), exception.Entries.Count, this.CountTrackedEntriesSafely());
+             return false;
+         }
+ 

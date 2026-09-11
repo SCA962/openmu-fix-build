@@ -1,0 +1,41 @@
+diff --git a/src/GameLogic/PlugIns/ChatCommands/NpcChatCommandPlugIn.cs b/src/GameLogic/PlugIns/ChatCommands/NpcChatCommandPlugIn.cs
+index 64de5be..6086f2e 100644
+--- a/src/GameLogic/PlugIns/ChatCommands/NpcChatCommandPlugIn.cs
++++ b/src/GameLogic/PlugIns/ChatCommands/NpcChatCommandPlugIn.cs
+@@ -52,9 +52,16 @@ public class NpcChatCommandPlugIn : ChatCommandPlugInBase<NpcChatCommandPlugIn.A
+         var configuration = this.Configuration ??= (NpcChatCommandConfiguration)this.CreateDefaultConfig();
+         var npcDefinition = configuration.OpenMerchantNpc;
+ 
+-        if (player.SelectedCharacter?.CharacterStatus >= CharacterStatus.GameMaster && arguments?.NpcId is { } npcIdStr)
++        // Every player may name the NPC, by number ("/npc 256") or by name ("/npc Lahap"). The original
++        // reserved the argument for game masters, which made the command useless for players beyond the
++        // single configured merchant. There is nothing to protect: any NPC this can open is one the
++        // player could also walk to, and monsters are refused below.
++        if (arguments?.NpcId is { } npcIdStr)
+         {
+-            if (int.TryParse(npcIdStr, out var npcId) && player.GameContext.Configuration.Monsters.FirstOrDefault(m => m.Number == npcId) is { } definition)
++            var definition = int.TryParse(npcIdStr, out var npcId)
++                ? player.GameContext.Configuration.Monsters.FirstOrDefault(m => m.Number == npcId)
++                : player.GameContext.Configuration.Monsters.FirstOrDefault(m => string.Equals(m.Designation, npcIdStr, StringComparison.OrdinalIgnoreCase));
++            if (definition is { } && definition.ObjectKind != NpcObjectKind.Monster)
+             {
+                 npcDefinition = definition;
+             }
+@@ -70,15 +77,8 @@ public class NpcChatCommandPlugIn : ChatCommandPlugInBase<NpcChatCommandPlugIn.A
+             return;
+         }
+ 
+-        if (npcDefinition.MerchantStore is null)
+-        {
+-            if (player.SelectedCharacter?.CharacterStatus >= CharacterStatus.GameMaster)
+-            {
+-                await player.ShowLocalizedBlueMessageAsync(nameof(PlayerMessage.NpcIsNotMerchant)).ConfigureAwait(false);
+-            }
+-
+-            return;
+-        }
++        // No MerchantStore requirement anymore: TalkNpcAction already knows how to open every NPC window
++        // (Lahap, vault, Chaos Machine, ...), not only stores. The requirement existed only in this command.
+ 
+         if (configuration.MinimumVipLevel > 0 && (player.Attributes?[Stats.IsVip] ?? 0) < configuration.MinimumVipLevel)
+         {

@@ -1,0 +1,37 @@
+diff --git a/src/GameLogic/PlayerActions/Items/PickupItemAction.cs b/src/GameLogic/PlayerActions/Items/PickupItemAction.cs
+index 9a177c5..9a548d3 100644
+--- a/src/GameLogic/PlayerActions/Items/PickupItemAction.cs
++++ b/src/GameLogic/PlayerActions/Items/PickupItemAction.cs
+@@ -117,9 +117,9 @@ public class PickupItemAction
+         return true;
+     }
+ 
+-    private static bool IsLimitReached(Player player, ItemDefinition? itemDefinition)
++    private static bool IsLimitReached(Player player, Item droppedItem)
+     {
+-        if (itemDefinition is null)
++        if (droppedItem.Definition is not { } itemDefinition)
+         {
+             return true;
+         }
+@@ -129,7 +129,10 @@ public class PickupItemAction
+             return false;
+         }
+ 
+-        return player.Inventory?.Items.Count(item => item.Definition == itemDefinition) >= itemDefinition.StorageLimitPerCharacter;
++        // The limit applies per level, not per definition. Items like the Wizard's Ring, the Ring of Honor
++        // or the Dark Stone share one definition across several levels which are different items to the
++        // player; counting them together refused a level 2 ring because a level 0 one was in the bag.
++        return player.Inventory?.Items.Count(item => item.Definition == itemDefinition && item.Level == droppedItem.Level) >= itemDefinition.StorageLimitPerCharacter;
+     }
+ 
+     private static bool PlayerHasActiveQuestForItem(Player player, Item item)
+@@ -154,7 +157,7 @@ public class PickupItemAction
+             return (false, null);
+         }
+ 
+-        if (IsLimitReached(player, droppedItem.Item.Definition))
++        if (IsLimitReached(player, droppedItem.Item))
+         {
+             var itemName = string.Empty;
+             using (CultureHelper.SetTemporaryCulture(player.Culture))

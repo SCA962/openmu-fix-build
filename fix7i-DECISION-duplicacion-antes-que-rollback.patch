@@ -1,0 +1,38 @@
+diff --git a/src/Persistence/EntityFramework/EntityFrameworkContextBase.cs b/src/Persistence/EntityFramework/EntityFrameworkContextBase.cs
+index b64345f..7694e56 100644
+--- a/src/Persistence/EntityFramework/EntityFrameworkContextBase.cs
++++ b/src/Persistence/EntityFramework/EntityFrameworkContextBase.cs
+@@ -122,10 +122,10 @@ internal class EntityFrameworkContextBase : IContext
+     /// <item>The row is gone and the entry is <see cref="EntityState.Deleted"/> - deleting it was the
+     /// intention and somebody already did it (the crafting handler destroying a consumed item is the
+     /// common case). Dropping the entry is safe: there is nothing left to delete.</item>
+-    /// <item>The row is gone and the entry is <see cref="EntityState.Modified"/> - detaching it would
+-    /// leave the object alive in memory, and a later Attach (a trade, a storage move) could insert it
+-    /// again as a new row. That is exactly how items get duplicated, so this method refuses to
+-    /// "recover" and leaves the decision to the caller.</item>
++    /// <item>The row is gone and the entry is <see cref="EntityState.Modified"/> - detaching it leaves
++    /// the object alive in memory, and a later Attach (a trade, a storage move) could insert it again
++    /// as a new row. The server owner decided that this is preferable to a session which stops saving,
++    /// so the entry is detached and the save is retried; the case is logged at Error level.</item>
+     /// </list>
+     /// </remarks>
+     private async ValueTask<bool> TryReconcileStaleEntriesAsync(DbUpdateConcurrencyException exception, CancellationToken cancellationToken)
+@@ -172,8 +172,16 @@ internal class EntityFrameworkContextBase : IContext
+                 continue;
+             }
+ 
+-            this._logger.LogError("Save conflict NOT resolvable: {Entry} no longer exists in the database. Leaving it attached on purpose - detaching it could resurrect a deleted row as a duplicate later on. Entries in this conflict: {ConflictEntries}, tracked entries in this context: {TrackedEntries}.", DescribeEntry(entry), exception.Entries.Count, this.CountTrackedEntriesSafely());
+-            return false;
++            // Decision taken by the server owner (09-09-2026): a row which may come back as a duplicate is
++            // preferred over a session which stops saving. Refusing here left the player's context broken
++            // for good - every later save failed too and on the next login the whole session was gone,
++            // which on a fast server means losing most of a reset in a few minutes. Detaching the entry
++            // lets this save and every later one go through; the price is that, if this same object is
++            // attached again later (a trade, a storage move), it can be inserted again as a new row.
++            // The line stays at Error level so that every such case remains visible and countable.
++            this._logger.LogError("Save conflict resolved by DETACHING: {Entry} no longer exists in the database but was still modified in memory. Detached so that this session keeps saving; if this object is attached again later it may come back as a new row. Entries in this conflict: {ConflictEntries}, tracked entries in this context: {TrackedEntries}.", DescribeEntry(entry), exception.Entries.Count, this.CountTrackedEntriesSafely());
++            entry.State = EntityState.Detached;
++            reconciled = true;
+         }
+ 
+         return reconciled;
