@@ -1,0 +1,173 @@
+name: Construir munique/openmu 0.9.10-fix7 (compila, PRUEBA, y solo entonces empaqueta)
+
+# Igual que build-openmu-fix4.yml (misma base, mismos 8 parches, mismo dotnet test antes de
+# empaquetar) mas los OCHO parches fix7a, fix7c..fix7i escritos el 11-09-2026 por el taller (fix7b descartado: MuMain 1.2.5 si conoce el 0xFD y lo necesita).
+# Resultado: un Release con openmu-0.9.10-fix7.tar.gz (docker save) y su sha256.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-openmu-fix7.yml'
+      - 'fix7*.patch'
+
+permissions:
+  contents: write
+
+env:
+  BASE_COMMIT: d4ca915c442a56e267e3f01638822f367fa81082
+  IMAGEN: munique/openmu:0.9.10-fix7
+
+jobs:
+  build:
+    name: OpenMU d4ca915c + los 8 de fix4 + fix7a,c..i (sin 7b)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Receta y parches (este repositorio)
+        uses: actions/checkout@v4
+        with:
+          path: receta
+
+      - name: Codigo de OpenMU en el commit exacto de la imagen 0.9.10
+        uses: actions/checkout@v4
+        with:
+          repository: MUnique/OpenMU
+          ref: d4ca915c442a56e267e3f01638822f367fa81082
+          path: OpenMU
+
+      - name: Comprobar la base
+        working-directory: OpenMU
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$BASE_COMMIT" || { echo "commit base inesperado" >&2; exit 1; }
+          grep -q 'AssemblyVersion("0.9.10.0")' src/SharedAssemblyInfo.cs || { echo "el commit base no dice version 0.9.10" >&2; exit 1; }
+          # El arbol tiene que estar COMPLETO: un checkout parcial hace que un parche "aplique limpio"
+          # solo porque el fichero que tocaria no esta. Ya dio un veredicto falso una vez.
+          test "$(ls tests | wc -l)" -ge 13 || { echo "el arbol de tests esta incompleto: $(ls tests | wc -l) entradas" >&2; exit 1; }
+          test -d tests/MUnique.OpenMU.AttributeSystem.Tests || { echo "falta AttributeSystem.Tests" >&2; exit 1; }
+
+      - name: Aplicar los 16 parches EN ORDEN, cada uno comprobado antes
+        working-directory: OpenMU
+        run: |
+          set -euo pipefail
+          for p in \
+            openmu-0.9.10-fix-guardado.patch \
+            openmu-0.9.10-fix3-guardado.patch \
+            openmu-0.9.10-fix4-registros.patch \
+            pr873-reentrancy-map-change-guard.patch \
+            pr914-player-slot-leak.patch \
+            pr887-composableattribute-race.patch \
+            fix5-quest-collection-modified.patch \
+            fix6-rango-recogida-registro-y-tope-del-ayudante.patch \
+            fix7a-comando-npc-para-todos.patch \
+            fix7c-dropid-y-posicion-en-recogida-rechazada.patch \
+            fix7d-limite-de-almacen-por-nivel.patch \
+            fix7e-registro-muerte-de-jefes.patch \
+            fix7f-nombre-en-el-aviso-de-desfase.patch \
+            fix7g-entries-count-en-la-reconciliacion.patch \
+            fix7h-refine-stone-registro-honesto.patch \
+            fix7i-DECISION-duplicacion-antes-que-rollback.patch ; do
+              echo "----- $p"
+              test -f "../receta/$p" || { echo "falta el parche $p en el repositorio" >&2; exit 1; }
+              git apply --check "../receta/$p"
+              git apply "../receta/$p"
+          done
+          git status --short
+
+      - name: Verificar que el arbol quedo como el ensayo en seco
+        working-directory: OpenMU
+        run: |
+          set -euo pipefail
+          m=$(git status --short | grep -c '^ M ' || true)
+          n=$(git status --short | grep -c '^?? ' || true)
+          echo "modificados=$m nuevos=$n"
+          [ "$m" = "23" ] && [ "$n" = "3" ] || { echo "esperaba 23 modificados y 3 nuevos, hay $m y $n" >&2; exit 1; }
+          # Los marcadores de fix4 (una pieza cada uno)
+          grep -q 'RunPersistenceExclusiveAsync'            src/GameLogic/Player.cs                                   || { echo "falta el candado por jugador (PR854)" >&2; exit 1; }
+          grep -q 'EXIT-FLOW start'                          src/GameLogic/Player.cs                                   || { echo "falta el registro del flujo de salida" >&2; exit 1; }
+          grep -q 'ConsecutiveSaveFailures'                  src/GameLogic/Player.cs                                   || { echo "falta el contador de fallos (B3)" >&2; exit 1; }
+          grep -q 'MaximumConsecutiveSaveFailures'           src/GameLogic/PlugIns/PeriodicSaveProgressPlugIn.cs       || { echo "falta B3 en el guardado periodico" >&2; exit 1; }
+          grep -q 'TryReconcileStaleEntriesAsync'            src/Persistence/EntityFramework/EntityFrameworkContextBase.cs || { echo "falta la reconciliacion (fix3 b)" >&2; exit 1; }
+          grep -q 'CountTrackedEntriesSafely'                src/Persistence/EntityFramework/EntityFrameworkContextBase.cs || { echo "falta el contador de entidades seguidas" >&2; exit 1; }
+          test "$(grep -c 'LOGIN rejected' src/GameLogic/PlayerActions/LoginAction.cs)" = "3"                          || { echo "esperaba los TRES sitios de rechazo de login" >&2; exit 1; }
+          grep -q 'LOGOUT requested'                         src/GameLogic/PlayerActions/LogoutAction.cs               || { echo "falta el registro del tipo de salida" >&2; exit 1; }
+          grep -q 'TRADE committing'                         src/GameLogic/PlayerActions/Trade/TradeButtonAction.cs    || { echo "falta el registro del comercio" >&2; exit 1; }
+          grep -q 'RequirementStates.ToList()'                src/GameLogic/PlayerActions/Quests/QuestExtensions.cs     || { echo "falta el arreglo de las misiones" >&2; exit 1; }
+          grep -q 'MaximumPickupDistance = 5'                 src/GameLogic/PlayerActions/Items/PickupItemAction.cs     || { echo "falta el rango de recogida" >&2; exit 1; }
+          grep -q 'PickupItemAction.MaximumPickupDistance'    src/GameLogic/Offline/ItemPickupHandler.cs                || { echo "falta el tope de busqueda del ayudante" >&2; exit 1; }
+          # Los marcadores de fix7 (uno por parche; los dos "no debe estar" son tan importantes como los otros)
+          grep -q 'NpcObjectKind.Monster'                     src/GameLogic/PlugIns/ChatCommands/NpcChatCommandPlugIn.cs || { echo "falta fix7a (/npc para todos)" >&2; exit 1; }
+          ! grep -q 'npcDefinition.MerchantStore is null'     src/GameLogic/PlugIns/ChatCommands/NpcChatCommandPlugIn.cs || { echo "fix7a no quito la exigencia de tienda" >&2; exit 1; }
+          grep -q 'ItemPickFailReason.ItemStacked'            src/GameLogic/PlayerActions/Items/PickupItemAction.cs     || { echo "el paquete ItemStacked TIENE que seguir: fix7b se descarto (MuMain 1.2.5 lo necesita para soltar el cerrojo de recogida)" >&2; exit 1; }
+          grep -q 'does not exist on map'                     src/GameLogic/PlayerActions/Items/PickupItemAction.cs     || { echo "falta fix7c (dropId en el camino ciego)" >&2; exit 1; }
+          grep -q 'item.Level == droppedItem.Level'           src/GameLogic/PlayerActions/Items/PickupItemAction.cs     || { echo "falta fix7d (limite por nivel)" >&2; exit 1; }
+          grep -q 'BOSS killed'                               src/GameLogic/NPC/AttackableNpcBase.cs                    || { echo "falta fix7e (muerte de jefes)" >&2; exit 1; }
+          grep -q 'WalkToAsync: Player \[{Player}\]'          src/GameLogic/Player.cs                                   || { echo "falta fix7f (nombre en el desfase)" >&2; exit 1; }
+          grep -q 'ConflictEntries'                           src/Persistence/EntityFramework/EntityFrameworkContextBase.cs || { echo "falta fix7g (Entries.Count)" >&2; exit 1; }
+          grep -q 'REFINE STONE'                              src/GameLogic/PlayerActions/Craftings/RefineStoneCrafting.cs || { echo "falta fix7h (refine stone)" >&2; exit 1; }
+          grep -q 'resolved by DETACHING'                     src/Persistence/EntityFramework/EntityFrameworkContextBase.cs || { echo "falta fix7i (duplicacion antes que rollback)" >&2; exit 1; }
+          echo "todos los marcadores presentes"
+
+      - name: Instalar el SDK de .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Compilar la solucion COMPLETA (incluye los proyectos de tests)
+        working-directory: OpenMU/src
+        run: dotnet build MUnique.OpenMU.sln --configuration Release -p:ci=true
+
+      - name: EJECUTAR LOS TESTS (esto es lo que convierte "escrito" en "probado")
+        working-directory: OpenMU/src
+        run: dotnet test MUnique.OpenMU.sln --configuration Release --no-build -p:ci=true --logger "trx;LogFileName=resultado.trx" --results-directory ../resultados
+
+      - name: Guardar el resultado de los tests pase lo que pase
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resultados-de-tests
+          path: OpenMU/resultados
+          if-no-files-found: warn
+
+      - name: Construir la imagen (mismo comando que el paquete)
+        working-directory: OpenMU/src
+        run: docker build -f Startup/Dockerfile -t "$IMAGEN" .
+
+      - name: Verificar la imagen
+        run: |
+          set -euo pipefail
+          docker image inspect "$IMAGEN" --format 'id {{.Id}} creada {{.Created}} tamano {{.Size}} bytes arquitectura {{.Architecture}}'
+          [ "$(docker image inspect "$IMAGEN" --format '{{.Architecture}}')" = "amd64" ] || { echo "arquitectura inesperada" >&2; exit 1; }
+
+      - name: Empaquetar (docker save)
+        run: |
+          set -euo pipefail
+          docker save "$IMAGEN" | gzip -6 > openmu-0.9.10-fix7.tar.gz
+          sha256sum openmu-0.9.10-fix7.tar.gz | tee sha256.txt
+          ls -l openmu-0.9.10-fix7.tar.gz
+
+      - name: Publicar release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="openmu-0.9.10-fix7-r${{ github.run_number }}"
+          {
+            echo "munique/openmu:0.9.10-fix7 = OpenMU en el commit $BASE_COMMIT (la misma base que la imagen oficial 0.9.10)"
+            echo "mas los 8 parches de la 0.9.10-fix4 (PR 854, fix3, registros, PR 873, PR 914, PR 887, fix5, fix6)"
+            echo "mas los ocho de fix7: /npc para todos y por nombre (a), [7b descartado: el cliente necesita el 0xFD],"
+            echo "dropId y posiciones en las recogidas rechazadas (c), limite de items por nivel (d), registro de"
+            echo "muerte de jefes (e), nombre en el aviso de desfase (f), Entries.Count en la reconciliacion (g),"
+            echo "registro honesto de Refine Stone (h) y la DECISION duplicacion-antes-que-rollback (i)."
+            echo
+            echo "Los tests de la solucion se ejecutaron y pasaron ANTES de construir esta imagen."
+            echo
+            echo "Cargar en el servidor: docker load -i openmu-0.9.10-fix7.tar.gz"
+            echo
+            echo "sha256:"
+            echo '```'
+            cat sha256.txt
+            echo '```'
+          } > notas.md
+          gh release create "$TAG" --repo "${{ github.repository }}" --title "munique/openmu:0.9.10-fix7 ($TAG)" --notes-file notas.md openmu-0.9.10-fix7.tar.gz sha256.txt
